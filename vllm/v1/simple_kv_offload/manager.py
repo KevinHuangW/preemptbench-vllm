@@ -3,6 +3,7 @@
 """Scheduler-side manager for SimpleCPUOffloadConnector."""
 
 import contextlib
+import os
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -36,6 +37,11 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+# Minimum num_computed_tokens for a request to be eligible for CPU offload.
+# 0 = disabled (offload all requests, existing behaviour).
+# Set via PROBE_LEN_OFFLOAD_THRESHOLD env var.
+_LEN_OFFLOAD_THRESHOLD: int = int(os.environ.get("PROBE_LEN_OFFLOAD_THRESHOLD", "0"))
 
 
 @dataclass
@@ -147,6 +153,10 @@ class SimpleCPUOffloadScheduler:
         # Event counters
         self._load_event_counter: int = 0
         self._store_event_counter: int = 0
+
+        # Length-selective offload: skip D2H for requests with fewer computed
+        # tokens than this threshold (recompute is cheaper).  0 = disabled.
+        self._len_offload_threshold: int = _LEN_OFFLOAD_THRESHOLD
 
         # For TP/PP: track partial store completions across steps.
         # Events must be reported by all world_size workers before considered complete.
@@ -359,7 +369,13 @@ class SimpleCPUOffloadScheduler:
             store_event=store_event,
             store_gpu_blocks=store_gpu,
             store_cpu_blocks=store_cpu,
-            need_flush=bool(scheduler_output.preempted_req_ids),
+            # Only flush if blocks were actually being DMA'd (avoids blocking
+            # worker.wait() when the preempted victim was below the length
+            # threshold and therefore never had a store event initiated).
+            need_flush=(
+                bool(scheduler_output.preempted_req_ids)
+                and bool(self._store_event_to_blocks)
+            ),
         )
         return result
 
@@ -470,6 +486,15 @@ class SimpleCPUOffloadScheduler:
         for req_id, new_block_id_groups, preempted in yield_req_data(scheduler_output):
             state = self._reqs_to_store.get(req_id)
             if state is None or state.finished:
+                continue
+
+            # Length-selective offload: skip DMA setup for requests that haven't
+            # reached the threshold.  This ensures no in-flight store event exists
+            # for their blocks, so need_flush can be safely skipped when they are
+            # the only preempted requests.
+            if (self._len_offload_threshold > 0
+                    and state.request.num_computed_tokens
+                    < self._len_offload_threshold):
                 continue
 
             # Accumulate new block IDs.

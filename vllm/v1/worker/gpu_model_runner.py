@@ -227,6 +227,8 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         invalid_req_indices: list[int],
         async_output_copy_stream: torch.cuda.Stream,
         vocab_size: int,
+        token_entropy: torch.Tensor | None = None,
+        token_p_eos: torch.Tensor | None = None,
     ):
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
@@ -239,6 +241,9 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         self._sampled_token_ids = sampled_token_ids
         self.vocab_size = vocab_size
         self._logprobs_tensors = logprobs_tensors
+        # PROBE: keep reference to GPU entropy and P(EOS) tensors
+        self._token_entropy = token_entropy
+        self._token_p_eos = token_p_eos
 
         # Initiate the copy on a separate stream, but do not synchronize it.
         default_stream = torch.cuda.current_stream()
@@ -250,6 +255,17 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
             self._logprobs_tensors_cpu = (
                 self._logprobs_tensors.to_cpu_nonblocking()
                 if self._logprobs_tensors
+                else None
+            )
+            # PROBE: async copy entropy and P(EOS) to CPU alongside logprobs
+            self._token_entropy_cpu = (
+                self._token_entropy.to("cpu", non_blocking=True)
+                if self._token_entropy is not None
+                else None
+            )
+            self._token_p_eos_cpu = (
+                self._token_p_eos.to("cpu", non_blocking=True)
+                if self._token_p_eos is not None
                 else None
             )
             self.async_copy_ready_event.record()
@@ -283,6 +299,17 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         output = self._model_runner_output
         output.sampled_token_ids = valid_sampled_token_ids
         output.logprobs = logprobs_lists
+        # PROBE: attach entropy and P(EOS) (already on CPU via async copy)
+        output.token_entropy = (
+            self._token_entropy_cpu.tolist()
+            if self._token_entropy_cpu is not None
+            else None
+        )
+        output.token_p_eos = (
+            self._token_p_eos_cpu.tolist()
+            if self._token_p_eos_cpu is not None
+            else None
+        )
         return output
 
 
@@ -4314,6 +4341,18 @@ class GPUModelRunner(
                 else:
                     logger.error("RoutedExpertsCapturer not initialized.")
 
+            # PROBE: move per-request entropy and P(EOS) to CPU for the sync path.
+            _probe_entropy: list[float] | None = None
+            _probe_p_eos: list[float] | None = None
+            if (
+                sampler_output is not None
+                and not self.use_async_scheduling
+            ):
+                if sampler_output.token_entropy is not None:
+                    _probe_entropy = sampler_output.token_entropy.cpu().tolist()
+                if sampler_output.token_p_eos is not None:
+                    _probe_p_eos = sampler_output.token_p_eos.cpu().tolist()
+
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
                 req_id_to_index=req_id_to_index_output_copy,
@@ -4326,6 +4365,8 @@ class GPUModelRunner(
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
+                token_entropy=_probe_entropy,
+                token_p_eos=_probe_p_eos,
             )
 
         if not self.use_async_scheduling:
@@ -4341,6 +4382,8 @@ class GPUModelRunner(
                 invalid_req_indices=invalid_req_indices,
                 async_output_copy_stream=self.async_output_copy_stream,
                 vocab_size=self.input_batch.vocab_size,
+                token_entropy=sampler_output.token_entropy,
+                token_p_eos=sampler_output.token_p_eos,
             )
         with record_function_or_nullcontext(
             "gpu_model_runner: set_async_sampled_token_ids"

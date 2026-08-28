@@ -178,6 +178,11 @@ class BlockPool:
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue: list[KVCacheEvent] = []
 
+        # Blocks whose GPU memory is in-flight to CPU (async D2H for proactive
+        # pre-offload).  ref_cnt has been decremented but blocks are held off
+        # the free queue until DMA completes.  Keyed by block_id.
+        self._draining: dict[int, "KVCacheBlock"] = {}
+
         self.metrics_collector = metrics_collector
 
     def get_cached_block(
@@ -421,6 +426,48 @@ class BlockPool:
         self.free_block_queue.append_n(
             [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
         )
+
+    def free_blocks_to_drain(
+        self, ordered_blocks: "Iterable[KVCacheBlock]"
+    ) -> list[int]:
+        """Decrement ref_cnt and park zero-ref blocks in the draining pool
+        instead of the free queue.  Returns the parked block IDs.
+
+        Called when starting proactive pre-offload: the GPU blocks are
+        logically released immediately (so the scheduler sees accurate free
+        counts) but physically protected from reallocation until async D2H
+        completes.
+
+        Also evicts the block from the prefix-cache hash index so concurrent
+        prefix-cache lookups cannot resurrect a draining block via touch()
+        (which would crash because draining blocks are not in the free queue
+        but have ref_cnt == 0).
+        """
+        block_ids: list[int] = []
+        for block in ordered_blocks:
+            block.ref_cnt -= 1
+            if block.ref_cnt == 0 and not block.is_null:
+                self._maybe_evict_cached_block(block)
+                self._draining[block.block_id] = block
+                block_ids.append(block.block_id)
+        return block_ids
+
+    def release_draining_blocks(self, block_ids: "Iterable[int]") -> None:
+        """Move blocks from the draining pool to the free queue.
+
+        Called when async D2H completes: DMA is done, the blocks can now be
+        safely reused by new requests.
+        """
+        to_release = [
+            self._draining.pop(bid) for bid in block_ids if bid in self._draining
+        ]
+        if to_release:
+            self.free_block_queue.append_n(to_release)
+
+    @property
+    def num_draining_blocks(self) -> int:
+        """Number of blocks currently in async D2H transit."""
+        return len(self._draining)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.

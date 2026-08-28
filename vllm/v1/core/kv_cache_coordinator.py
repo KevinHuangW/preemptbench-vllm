@@ -198,6 +198,13 @@ class KVCacheCoordinator(ABC):
         for manager in self.single_type_managers:
             manager.free(request_id)
 
+    def free_to_drain(self, request_id: str) -> list[int]:
+        """Free request blocks to draining pool; returns all draining block IDs."""
+        block_ids: list[int] = []
+        for manager in self.single_type_managers:
+            block_ids.extend(manager.free_to_drain(request_id))
+        return block_ids
+
     def get_num_common_prefix_blocks(self, running_request_id: str) -> list[int]:
         """
         Get the number of common prefix blocks for all requests with allocated

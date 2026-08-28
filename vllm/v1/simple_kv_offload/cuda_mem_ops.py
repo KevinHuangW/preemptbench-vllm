@@ -136,18 +136,22 @@ def copy_blocks(
     sz_all = np.repeat(params.bpb, n)
 
     total = n * params.num_layers
+    # cuMemcpyBatchAsync expects attrsIdxs to be an array of `total` indices
+    # (one per copy), not a scalar. All copies use attr set 0.
+    attrs_idx_arr = np.zeros(total, dtype=np.uint64)
+    fail_idx = ctypes.c_size_t(0)
     err = _batch_memcpy_fn(
         dst_all.ctypes.data,
         src_all.ctypes.data,
         sz_all.ctypes.data,
         total,
         ctypes.addressof(params.attrs),
-        ctypes.byref(params.attrs_idx),
+        attrs_idx_arr.ctypes.data,
         1,
-        ctypes.byref(params.fail_idx),
+        ctypes.byref(fail_idx),
         params.stream_handle,
     )
     if err != 0:
         raise RuntimeError(
-            f"cuMemcpyBatchAsync failed: err={err} failIdx={params.fail_idx.value}"
+            f"cuMemcpyBatchAsync failed: err={err} failIdx={fail_idx.value}"
         )

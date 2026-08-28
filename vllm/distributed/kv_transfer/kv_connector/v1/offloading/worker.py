@@ -58,6 +58,10 @@ class OffloadingConnectorWorker:
         self._unsubmitted_store_jobs: list[tuple[int, TransferSpec]] = []
 
         self._finished_reqs_waiting_for_store: set[ReqId] = set()
+        # Requests being proactively pre-offloaded by PROBE.  When all their
+        # store jobs complete the req_id is added to finished_sending so the
+        # scheduler can free GPU blocks and move the request to waiting.
+        self._probe_pre_offloading: set[ReqId] = set()
 
     def _generate_job_id(self) -> int:
         job_id = self._job_counter
@@ -302,6 +306,18 @@ class OffloadingConnectorWorker:
             assert success
         self._unsubmitted_store_jobs.clear()
 
+        # Submit proactive store jobs immediately (no sync wait — they overlap
+        # with subsequent forward passes and complete asynchronously).
+        for req_id, transfer_spec in (
+            kv_connector_metadata.reqs_to_proactive_store or {}
+        ).items():
+            job_id = self._generate_job_id()
+            self._jobs[job_id] = (req_id, True)
+            self._store_jobs[req_id].add(job_id)
+            self._probe_pre_offloading.add(req_id)
+            success = self.worker.transfer_async(job_id, transfer_spec)
+            assert success
+
         for req_id in kv_connector_metadata.reqs_to_flush or ():
             job_ids = self._store_jobs.get(req_id)
             if job_ids:
@@ -364,7 +380,13 @@ class OffloadingConnectorWorker:
                 if req_jobs:
                     continue
 
-                if req_id in self._finished_reqs_waiting_for_store:
+                if req_id in self._probe_pre_offloading:
+                    # Proactive pre-offload D2H complete: signal the scheduler
+                    # to free GPU blocks and transition request to waiting.
+                    self._probe_pre_offloading.discard(req_id)
+                    finished_sending.add(req_id)
+                    del self._store_jobs[req_id]
+                elif req_id in self._finished_reqs_waiting_for_store:
                     self._finished_reqs_waiting_for_store.remove(req_id)
                     finished_sending.add(req_id)
                     del self._store_jobs[req_id]

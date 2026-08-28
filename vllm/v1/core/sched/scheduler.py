@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import json
+import math
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -11,6 +14,1208 @@ import numpy as np
 
 from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
+from vllm.v1 import probe_preempt_logger as _ppl
+
+# PROBE victim selection policy (set via PROBE_VICTIM env var).
+# PROBE_VICTIM=default              → vLLM FCFS (newest-first LIFO, unchanged)            [baseline: vLLM SOSP'23]
+# PROBE_VICTIM=shortest_first       → smallest current KV cache (min num_computed_tokens) [baseline: B1 / InferMax arXiv 2411.07447]
+# PROBE_VICTIM=least_decoded        → fewest output tokens so far (min num_output_tokens)  [baseline: B2 least-decoded-first]
+# PROBE_VICTIM=largest_kv           → largest current KV cache (max num_computed_tokens)   [baseline: B3 largest-KV-first]
+# PROBE_VICTIM=input_length         → longest input prompt (max num_prompt_tokens)         [baseline: B4 / FastServe arXiv 2305.05920]
+# PROBE_VICTIM=benefit_cost         → max(kv_freed / recompute_cost) = num_computed/num_prompt [baseline: B5 / DBMS-inspired]
+# PROBE_VICTIM=probe_slope          → improved g_rough: log-length bias + fast EMA + slope penalty [ours: P3]
+# PROBE_VICTIM=probe_spike          → log-length × EMA-of-spike-indicator (H>1.0); replaces EMA slope [ours: P5]
+# PROBE_VICTIM=oracle               → score = expected_total_tokens − num_computed (cheats: uses precomputed
+#                                     prompt-hash → length lookup at PROBE_ORACLE_PATH). Upper bound for any
+#                                     length-aware policy.
+#
+# Orthogonal admission control:
+# PROBE_ADMISSION=oracle            → before admitting a waiting request, sum projected remaining KV blocks
+#                                     across running requests using the same oracle lookup; if this exceeds
+#                                     free pool blocks (with a small margin), skip admission this step.
+#                                     Combined with PROBE_VICTIM=default this gives "oracle_admit"; combined
+#                                     with PROBE_VICTIM=oracle this gives "oracle_full".  Tests whether
+#                                     admission control alone (without smart preemption) suffices to dodge
+#                                     the discard-mode recompute thrash.
+# PROBE_ADMISSION_MARGIN=<float>    → fraction of free blocks reserved for the admitted request itself
+#                                     (default 0.10).
+#   Changes vs. probe (P1):
+#     C — length multiplier replaced with log(1+tokens): kills quadratic length bias while
+#         retaining a tiebreaker signal among sequences at the same entropy level.
+#     A — uses fast EMA (α=0.3) in the base term so victim score drops quickly when a
+#         sequence transitions to low-entropy (converging / answering) phase, and adds
+#         λ·max(fast_h−slow_h, 0) slope bonus to further prioritise sequences whose
+#         entropy is actively rising. Both changes are model-agnostic: they detect
+#         phase transitions by entropy trajectory, not by token identity.
+#   Tune λ via PROBE_SLOPE_LAMBDA env var (default 1.0).
+# PROBE_VICTIM=probe_slope_ring     → P3 scorer (g_slope) + ring calibration with live KV pressure [ours: P4]
+#   Ring keyed on g_slope; memory_pressure (1−free/total) injected into ring.query() to drive
+#   pressure-adaptive quantile (0.5→0.9); n_buckets=16 spans 128→16384 tokens.
+# PROBE_VICTIM=probe_slope_peos     → P3 variant using P(EOS) instead of token entropy [ablation: A1]
+# PROBE_VICTIM=random               → uniform random victim among running reqs, seeded by
+#                                     PROBE_VICTIM_SEED (defaults to PROBE_POISSON_SEED) for
+#                                     reproducibility [control: does victim identity matter at all?]
+_PROBE_VICTIM = os.environ.get("PROBE_VICTIM", "default")
+_PROBE_VICTIM_SEED = int(os.environ.get(
+    "PROBE_VICTIM_SEED", os.environ.get("PROBE_POISSON_SEED", "42")))
+import random as _random_mod
+_victim_rng = _random_mod.Random(_PROBE_VICTIM_SEED)  # used only by PROBE_VICTIM=random
+
+# PROBE M3 constants.
+# H_max = ln(vocab_size); GPT-OSS-120B uses tiktoken cl100k vocab (128 256 tokens)
+# ln(128256) ≈ 11.762
+_PROBE_H_MAX: float = 11.762
+_PROBE_EPS: float = 1e-6
+_PROBE_EMA_ALPHA: float = 0.1        # slow EMA — stable level signal
+_PROBE_EMA_ALPHA_FAST: float = 0.3   # fast EMA — tracks recent entropy; responds in ~7 tokens
+_PROBE_SPIKE_ALPHA: float = 0.05     # spike-rate EMA — ~20-token recency window
+_PROBE_SPIKE_THRESHOLD: float = float(os.environ.get("PROBE_SPIKE_THRESHOLD", "1.0"))  # H > threshold = decision point
+_PROBE_ZERO_THRESHOLD: float = float(os.environ.get("PROBE_ZERO_THRESHOLD", "0.05"))    # H < threshold = high-confidence step (paired with spike for 2-feature predictor)
+_PROBE_SLOPE_LAMBDA: float = float(os.environ.get("PROBE_SLOPE_LAMBDA", "1.0"))
+# Slope penalty weight for probe_slope.  Adds λ·max(fast_h−slow_h, 0) to the
+# victim score, boosting priority of sequences whose entropy is actively rising
+# (still expanding) vs. those that have already peaked and are converging.
+# λ=1.0 keeps the bonus on the same scale as the log-length base term at
+# moderate entropy; tune via PROBE_SLOPE_LAMBDA env var.
+# Proactive trigger: fire when free KV blocks drop below this fraction of total.
+_PROBE_HEADROOM_FRAC: float = float(os.environ.get("PROBE_HEADROOM_FRAC", "0.15"))
+
+# P3e: weight for the symmetric convergence discount term.
+# Adds -γ·max(slow_h - fast_h, 0) to make actively-converging sequences easier to evict.
+_PROBE_SLOPE_GAMMA: float = float(os.environ.get("PROBE_SLOPE_GAMMA", "0.5"))
+# P3f: weight for the P(EOS) fusion discount.
+# Subtracts δ·fast_ema_p_eos from the entropy score (high P(EOS) → near termination → easier to evict).
+_PROBE_PEOS_DELTA: float = float(os.environ.get("PROBE_PEOS_DELTA", "1.0"))
+# P3g: exponential decay rate for the peak-entropy discount.
+# score × exp(-β · peak_gap / H_max); β=2 → 37% weight when gap = H_max/2.
+_PROBE_PEAK_BETA: float = float(os.environ.get("PROBE_PEAK_BETA", "2.0"))
+# P3c: KV utilization thresholds for adaptive λ scaling.
+# λ_eff = λ at kv_util ≤ LAM_LOW; λ_eff = 0 at kv_util ≥ LAM_HIGH; linear between.
+_PROBE_ADAPTIVE_LAM_LOW: float = float(os.environ.get("PROBE_ADAPTIVE_LAM_LOW", "0.80"))
+_PROBE_ADAPTIVE_LAM_HIGH: float = float(os.environ.get("PROBE_ADAPTIVE_LAM_HIGH", "0.95"))
+# Module-level KV pressure for P3c (updated each schedule() step).
+_probe_kv_pressure: float = 0.0
+# Warm-init reset value for P3b (H_max when victim is probe_slope_b, else 0.0).
+_PROBE_RESET_H: float = _PROBE_H_MAX if _PROBE_VICTIM == "probe_slope_b" else 0.0
+
+# PROBE P4: probe_slope_ring — ring calibrated on g_slope with pressure injection.
+# n_buckets=16: len buckets span up to 2^15=32768 tokens so AIME sequences
+# (500–8000 tokens) spread across buckets 9–13 instead of all landing in bucket 7.
+_PROBE_SLOPE_RING = None
+if _PROBE_VICTIM == "probe_slope_ring":
+    from vllm.v1.probe_ring import GrowthRing as _GrowthRing  # noqa: F811
+    _PROBE_SLOPE_RING = _GrowthRing(
+        n_buckets=int(os.environ.get("PROBE_SLOPE_RING_BUCKETS", "16"))
+    )
+
+# P4 sustained-pressure EMA: updated every scheduling step so it tracks ambient
+# KV occupancy, not the instantaneous spike at preemption time (which is always
+# ≈1.0 since preemption only fires when allocation fails).
+# Hysteresis gate: ring activates when EMA ≥ ACTIVATE (0.90) and stays active
+# until EMA drops below DEACTIVATE (0.85).  The 5-point band prevents the ring
+# from flipping on/off at the saturation boundary (N≈88–96).  Below the band
+# the ring is fully passive (pure P3 behaviour); above it the ring is fully
+# active with pressure-adaptive calibration.
+_probe_kv_ema: float = 0.0
+_probe_ring_active: bool = False          # hysteresis state
+_PROBE_KV_EMA_ALPHA: float = 0.02        # ~50-step time constant; ~1 s at 20 Hz
+_PROBE_SLOPE_RING_ACTIVATE: float = float(
+    os.environ.get("PROBE_SLOPE_RING_ACTIVATE", "0.90")
+)
+_PROBE_SLOPE_RING_DEACTIVATE: float = float(
+    os.environ.get("PROBE_SLOPE_RING_DEACTIVATE", "0.85")
+)
+
+# Pending ring updates: req_id → (num_computed_at_preempt, g_score_at_preempt,
+#                                  num_output_tokens_at_preempt)
+# Populated when a request is preempted; consumed when it eventually finishes.
+_probe_slope_ring_pending: dict[str, tuple[float, float, int]] = {}
+
+
+def _probe_g_spike(request) -> float:  # type: ignore[return]
+    """Victim score for probe_spike: log-length × EMA-of-spike-indicator.
+
+    Replaces the fast-slow EMA slope with a recency-weighted count of
+    high-entropy (H > 1.0 nat) tokens — decision-point bursts in reasoning
+    traces.  Spike-rate EMA (α=0.05, ~20-token window) has Spearman ρ ≈ 0.58
+    with total decode length vs ρ ≈ 0 for the EMA slope (see
+    entropy/length_pred_study/REPORT.md).  No calibration coefficients needed.
+    """
+    return math.log1p(request.num_computed_tokens) * request.probe_spike_ema
+
+
+# Oracle policy state (lazy-loaded on first scoring call to avoid load cost
+# in policies that don't use it).  PROBE_ORACLE_PATH points to a JSON file
+# produced by scripts/build_oracle_lookup.py.  The lookup keys are SHA-1
+# hashes of the prompt's first/last 32 token IDs.
+import hashlib as _hashlib
+_PROBE_ORACLE_PATH = os.environ.get("PROBE_ORACLE_PATH", "")
+_ORACLE_LOOKUP: dict[str, dict] | None = None
+_ORACLE_FALLBACK: int = 12000
+_ORACLE_HASH_PREFIX_LEN: int = 32
+_ORACLE_HASH_SUFFIX_LEN: int = 32
+# direct_id schema constants (populated when scheme == "direct_id"):
+_ORACLE_USER_CONTENT_START: int = 74
+_ORACLE_SLICE_LENGTH: int = 32
+_ORACLE_REQ_CACHE: dict[str, int] = {}  # req_id -> resolved expected_total
+
+
+def _oracle_hash_window(token_ids, start: int, length: int) -> str:
+    if start >= 0:
+        sub = tuple(token_ids[start:start + length])
+    else:
+        sub = tuple(token_ids[start:])
+    return _hashlib.sha1(repr(sub).encode()).hexdigest()[:16]
+
+
+_ORACLE_HASH_SCHEME = "prefix_suffix"  # or "full_prompt", "len_plus_suffix", "direct_id"
+
+
+def _oracle_load_if_needed() -> None:
+    global _ORACLE_LOOKUP, _ORACLE_FALLBACK
+    global _ORACLE_HASH_PREFIX_LEN, _ORACLE_HASH_SUFFIX_LEN, _ORACLE_HASH_SCHEME
+    global _ORACLE_USER_CONTENT_START, _ORACLE_SLICE_LENGTH
+    if _ORACLE_LOOKUP is not None or not _PROBE_ORACLE_PATH:
+        return
+    try:
+        with open(_PROBE_ORACLE_PATH) as fh:
+            data = json.load(fh)
+        # New direct_id schema (slice-based lookup) vs old hash-based schemas
+        schema = str(data.get("schema", ""))
+        if schema == "direct_id":
+            _ORACLE_LOOKUP = dict(data.get("slice_to_entry", {}))
+            _ORACLE_HASH_SCHEME = "direct_id"
+            _ORACLE_USER_CONTENT_START = int(data.get("user_content_start", 74))
+            _ORACLE_SLICE_LENGTH = int(data.get("slice_length", 32))
+        else:
+            _ORACLE_LOOKUP = dict(data.get("lookup", {}))
+            _ORACLE_HASH_SCHEME = str(data.get("hash_scheme", "prefix_suffix"))
+            _ORACLE_HASH_PREFIX_LEN = int(data.get("hash_prefix_len", 32))
+            _ORACLE_HASH_SUFFIX_LEN = int(data.get("hash_suffix_len", 32))
+        _ORACLE_FALLBACK = int(data.get("fallback_expected_total", 12000))
+        extra = ""
+        if _ORACLE_HASH_SCHEME == "direct_id":
+            extra = (f", user_content_start={_ORACLE_USER_CONTENT_START}, "
+                     f"slice_length={_ORACLE_SLICE_LENGTH}")
+        print(f"[PROBE oracle] loaded {len(_ORACLE_LOOKUP)} entries, "
+              f"scheme={_ORACLE_HASH_SCHEME}, fallback={_ORACLE_FALLBACK}{extra}",
+              flush=True)
+    except Exception as e:
+        # Fail loud once and fall back to the static default; don't crash sched.
+        print(f"[PROBE oracle] failed to load {_PROBE_ORACLE_PATH}: {e}",
+              flush=True)
+        _ORACLE_LOOKUP = {}
+
+
+_ORACLE_HIT_CACHE: dict[str, bool] = {}  # req_id -> True if lookup hit (not fallback)
+_PROBE_ORACLE_LOG_MISS = os.environ.get("PROBE_ORACLE_LOG_MISS", "1") not in ("0", "false", "False", "")
+
+
+def _oracle_resolve(request) -> int:
+    """Return expected_total_tokens for this request (with caching).
+
+    On the FIRST resolution per request (not cached), if the lookup misses
+    (falls back to default), prints a "[PROBE oracle] MISS" line so silent
+    fallback doesn't go unnoticed. Subsequent calls hit the cache and are
+    silent. Gate via PROBE_ORACLE_LOG_MISS=0 if log volume becomes a problem.
+    """
+    rid = request.request_id
+    if rid in _ORACLE_REQ_CACHE:
+        return _ORACLE_REQ_CACHE[rid]
+    _oracle_load_if_needed()
+    expected = _ORACLE_FALLBACK
+    is_hit = False
+    diag_slice = None
+    if _ORACLE_LOOKUP:
+        ids = request.prompt_token_ids
+        if _ORACLE_HASH_SCHEME == "direct_id":
+            # Slice the fixed (offset, length) window of prompt token IDs.
+            # Sweep client prepends "[TASK aime=NNN attempt=KK]\n\n" to user
+            # content, so this slice uniquely identifies (problem, attempt).
+            start = _ORACLE_USER_CONTENT_START
+            end = start + _ORACLE_SLICE_LENGTH
+            slice_key = repr(tuple(ids[start:end]))
+            diag_slice = slice_key
+            entry = _ORACLE_LOOKUP.get(slice_key)
+        elif _ORACLE_HASH_SCHEME == "full_prompt":
+            h = _hashlib.sha1(repr(tuple(ids)).encode()).hexdigest()[:16]
+            entry = _ORACLE_LOOKUP.get(h)
+        elif _ORACLE_HASH_SCHEME == "len_plus_suffix":
+            suf = tuple(ids[-_ORACLE_HASH_SUFFIX_LEN:])
+            h = _hashlib.sha1(repr((len(ids), suf)).encode()).hexdigest()[:16]
+            entry = _ORACLE_LOOKUP.get(h)
+        elif _ORACLE_HASH_SCHEME == "suffix":
+            entry = _ORACLE_LOOKUP.get(
+                _oracle_hash_window(ids, -_ORACLE_HASH_SUFFIX_LEN,
+                                    _ORACLE_HASH_SUFFIX_LEN))
+        else:
+            h_pref = _oracle_hash_window(ids, 0, _ORACLE_HASH_PREFIX_LEN)
+            entry = _ORACLE_LOOKUP.get(h_pref)
+            if entry is None:
+                h_suff = _oracle_hash_window(ids, -_ORACLE_HASH_SUFFIX_LEN,
+                                             _ORACLE_HASH_SUFFIX_LEN)
+                entry = _ORACLE_LOOKUP.get(h_suff)
+        if entry and entry.get("expected_total") is not None:
+            expected = int(entry["expected_total"])
+            is_hit = True
+    if not is_hit and _PROBE_ORACLE_LOG_MISS:
+        # First-time miss for this rid → log so silent fallback is visible.
+        diag = ""
+        if diag_slice is not None:
+            diag = f" slice={diag_slice[:96]}{'...' if len(diag_slice) > 96 else ''}"
+        print(f"[PROBE oracle] MISS rid={rid} scheme={_ORACLE_HASH_SCHEME} "
+              f"→ fallback={_ORACLE_FALLBACK}{diag}",
+              flush=True)
+    _ORACLE_REQ_CACHE[rid] = expected
+    _ORACLE_HIT_CACHE[rid] = is_hit
+    return expected
+
+
+def _oracle_log_decision(victim, running_reqs) -> None:
+    """Log one preempt-decision record for offline verification.
+
+    Writes to PROBE_ORACLE_DECISION_LOG (one JSON line per oracle preempt):
+      victim       : (req_id, expected_total, num_output_tokens, score, hit)
+      pool_stats   : n, n_hit, n_fallback, score_p50, score_max
+      victim_rank  : 0 = longest remaining among hits, ... (− if fallback)
+    """
+    path = os.environ.get("PROBE_ORACLE_DECISION_LOG", "")
+    if not path:
+        return
+    try:
+        # Compute scores for ALL running requests (cheap: cached lookup).
+        scores = []
+        for r in running_reqs:
+            exp = _oracle_resolve(r)
+            sc = float(exp - r.num_output_tokens)
+            hit = _ORACLE_HIT_CACHE.get(r.request_id, False)
+            scores.append((sc, hit, r.request_id, exp, r.num_output_tokens))
+        scores.sort(reverse=True)  # highest score first
+        # Find victim's rank in the sorted list
+        v_rid = victim.request_id
+        v_rank = next((i for i, s in enumerate(scores) if s[2] == v_rid), -1)
+
+        n = len(scores)
+        n_hit = sum(1 for s in scores if s[1])
+        n_fb = n - n_hit
+        if n > 0:
+            sc_vals = [s[0] for s in scores]
+            p50 = sc_vals[n // 2]
+            mx = sc_vals[0]
+        else:
+            p50 = mx = 0.0
+
+        v_exp = _oracle_resolve(victim)
+        v_dec = victim.num_output_tokens
+        v_hit = _ORACLE_HIT_CACHE.get(v_rid, False)
+        rec = {
+            "t": time.time(),
+            "victim": {
+                "req_id": v_rid,
+                "expected_total": v_exp,
+                "num_output_tokens": v_dec,
+                "score": float(v_exp - v_dec),
+                "hit": v_hit,
+                "rank_in_pool": v_rank,
+            },
+            "pool": {"n": n, "n_hit": n_hit, "n_fallback": n_fb,
+                     "score_p50": p50, "score_max": mx},
+        }
+        with open(path, "a", buffering=1) as f:
+            f.write(json.dumps(rec) + "\n")
+    except Exception as e:
+        # Never let logging crash scheduling.
+        print(f"[PROBE oracle-decision-log] {e}", flush=True)
+
+
+def _probe_g_oracle(request) -> float:  # type: ignore[return]
+    """Victim score for oracle: predicted remaining tokens.
+
+    score = expected_total_decode_tokens - num_computed_tokens
+    Higher score = more work left = preferred preemption victim.
+
+    expected_total_decode_tokens is looked up by hashing the prompt token IDs
+    against a precomputed table built from previous T=0 runs of the same
+    workload.  Greedy decoding makes T=0 lengths ~deterministic per prompt,
+    so this is genuinely an oracle ceiling for length-aware victim selection.
+    """
+    expected_total = _oracle_resolve(request)
+    # Oracle gives expected total OUTPUT (completion) tokens; num_computed
+    # includes prompt + generated, so we use num_output_tokens for fairness.
+    decoded = request.num_output_tokens
+    return float(expected_total - decoded)
+
+
+# Orthogonal admission control.
+_PROBE_ADMISSION = os.environ.get("PROBE_ADMISSION", "")
+
+# PROBE: reactive-only offload mode.
+# When PROBE_REACTIVE_OFFLOAD=1 and the offloading connector is attached,
+# preempted requests stash their remaining KV blocks to CPU via async D2H
+# (using the existing free_to_drain + PRE_OFFLOADING + proactive-store
+# pipeline that was previously dead code).  The trigger condition is
+# UNCHANGED from DISCARD mode — only the per-preempt cost changes
+# (PCIe transfer instead of full re-prefill on resume).  Designed for the
+# clean experiment: identical victim selection + identical event counts
+# vs DISCARD, only resume cost differs.
+_PROBE_REACTIVE_OFFLOAD: bool = (
+    os.environ.get("PROBE_REACTIVE_OFFLOAD", "0") == "1"
+)
+_PROBE_ADMISSION_MARGIN = float(os.environ.get("PROBE_ADMISSION_MARGIN", "0.10"))
+
+# Co-designed admission+preempt for discard mode.
+# beta penalises decoded work so we don't evict requests that have paid
+# heavy recompute cost.  threshold lets admission ask "is there a cheap
+# victim available?" before refusing — the two halves work together.
+_PROBE_PREEMPT_BETA = float(os.environ.get("PROBE_PREEMPT_BETA", "1.0"))
+_PROBE_ADMIT_THRESHOLD = float(os.environ.get("PROBE_ADMIT_THRESHOLD", "0.0"))
+# Offload-mode swap-back-cost horizon: requests with remaining decode tokens
+# below this are protected from eviction (their KV would be paged out and back
+# very soon, making the swap a net loss).  Used by kv_remaining_swapaware_*.
+_PROBE_SWAP_C = float(os.environ.get("PROBE_SWAP_C", "1000"))
+# SF-aware admission: refuse if the SF-chosen victim (argmin num_computed) still
+# has > this many tokens of expected remaining work — protects long fresh jobs
+# from getting evicted by SF and causing recompute thrash.
+_PROBE_ADMIT_SF_REMAINING_MAX = int(os.environ.get("PROBE_ADMIT_SF_REMAINING_MAX", "2000"))
+
+# Adaptive β: scales between BETA_MIN and BETA_MAX as util^BETA_K
+_PROBE_BETA_MIN = float(os.environ.get("PROBE_BETA_MIN", "0.5"))
+_PROBE_BETA_MAX = float(os.environ.get("PROBE_BETA_MAX", "2.5"))
+_PROBE_BETA_K = float(os.environ.get("PROBE_BETA_K", "2.0"))
+
+# Predictive admission: simulate forward H seconds, refuse if peak > capacity.
+# Decode rate model: 1 token per request per scheduling step (vLLM batch decode).
+_PROBE_PRED_HORIZON_STEPS = int(os.environ.get("PROBE_PRED_HORIZON_STEPS", "1000"))
+
+
+def _kv_utilization(block_pool) -> float:
+    free = block_pool.get_num_free_blocks()
+    total = getattr(block_pool, "num_gpu_blocks", None)
+    if total is None or total <= 0:
+        return 0.0
+    return max(0.0, 1.0 - free / total)
+
+
+def _adaptive_beta(util: float) -> float:
+    return _PROBE_BETA_MIN + (_PROBE_BETA_MAX - _PROBE_BETA_MIN) * (util ** _PROBE_BETA_K)
+
+
+def _probe_g_oracle_co_adapt(request, block_pool=None) -> float:
+    """oracle_co with adaptive β tracking KV utilization.
+
+    Uses module-global _CURRENT_ADAPTIVE_BETA which the dispatch site updates
+    each schedule() round. β starts low (admit eagerly) and ramps up as KV
+    pool fills, naturally tightening admission and protecting decoded work
+    when the pool is hot.
+    """
+    expected_total = _oracle_resolve(request)
+    decoded = request.num_output_tokens
+    return float(expected_total - (1.0 + _CURRENT_ADAPTIVE_BETA) * decoded)
+
+
+_CURRENT_ADAPTIVE_BETA: float = 1.0  # updated each schedule() round
+
+
+def _oracle_co_adapt_admission_should_refuse(running_reqs, block_pool, block_size):
+    """Same shape as oracle_co admission, but using adaptive β for victim score."""
+    free = block_pool.get_num_free_blocks()
+    if free <= 0:
+        return True
+    projected = 0
+    for req in running_reqs:
+        exp = _oracle_resolve(req)
+        rem = exp - req.num_output_tokens
+        if rem > 0:
+            projected += (rem + block_size - 1) // block_size
+    available = max(1, int(free * (1.0 - _PROBE_ADMISSION_MARGIN)))
+    if projected <= available:
+        return False
+    if not running_reqs:
+        return True
+    best_score = max(_probe_g_oracle_co_adapt(r) for r in running_reqs)
+    return best_score < _PROBE_ADMIT_THRESHOLD
+
+
+# Method 5 — Two-level priority queues (long/short classification by oracle).
+# Long requests (expected_total >= LONG_THRESHOLD) get a hard concurrent-count
+# cap; shorts always admit. Preempt side is default LIFO (which naturally
+# evicts shorts as they're newest).
+_PROBE_LONG_THRESHOLD = int(os.environ.get("PROBE_LONG_THRESHOLD", "25000"))
+_PROBE_MAX_LONG_INFLIGHT = int(os.environ.get("PROBE_MAX_LONG_INFLIGHT", "4"))
+
+
+def _is_long_request(request) -> bool:
+    return _oracle_resolve(request) >= _PROBE_LONG_THRESHOLD
+
+
+def _two_level_should_skip_arrival(arrival, running_reqs) -> bool:
+    """Per-arrival check: returns True if this arrival should be skipped
+    (deferred to skipped_waiting) because it's a long request and the
+    long-lane is at capacity. Shorts are always admitted."""
+    if not _is_long_request(arrival):
+        return False
+    n_long = sum(1 for r in running_reqs if _is_long_request(r))
+    return n_long >= _PROBE_MAX_LONG_INFLIGHT
+
+
+def _sf_oracle_tiebreak_key(request) -> tuple[int, float]:
+    """SF + oracle remaining-decode tiebreaker.
+
+    Primary: num_computed_tokens (same as shortest_first — minimize recompute
+    cost on resume).  Secondary (tiebreak among equal-or-near-equal primary):
+    negative remaining-decode, so among cheap victims we prefer the one with
+    the LONGEST remaining work (most "opportunity" to delay).
+
+    Used with `min(running, key=...)` — smaller primary wins; among ties,
+    smaller secondary (= larger remaining_decode) wins.
+
+    Admission and trigger condition: unchanged from shortest_first.
+    """
+    decoded = request.num_output_tokens
+    expected_total = _oracle_resolve(request)
+    remaining = max(0, expected_total - decoded)
+    # Tiebreak field is negative remaining, scaled down so it only affects
+    # ordering when primary values are very close.  Negative → min picks
+    # LARGEST remaining among ties.
+    return (request.num_computed_tokens, -float(remaining))
+
+
+def _probe_g_smart_lifo(request) -> float:
+    """Method 3 — Smart-LIFO scoring: among requests with low decoded
+    (cheap to recompute), favor those with largest expected_total. Score
+    = expected_total / max(1, decoded). High score = fresh long-tail
+    request — best preempt victim because it's both cheap to redo AND
+    has the most pending KV pressure to release.
+    """
+    expected = _oracle_resolve(request)
+    decoded = max(1, request.num_output_tokens)
+    return float(expected / decoded)
+
+
+def _oracle_reservation_admission_should_refuse(running_reqs, block_pool, block_size):
+    """Method 4 — Reservation-based admission. Each in-flight request
+    "reserves" its full peak KV (= expected_total / block_size).  If the
+    sum of reservations exceeds (1 - margin) * total capacity, refuse new
+    admissions.  No preempt-side change — uses whatever PROBE_VICTIM is
+    set to (default LIFO if the synthetic policy is reservation_admit).
+
+    Difference from oracle_admit: that one summed *remaining* blocks (which
+    drops as decode progresses); this one sums *peak* blocks (constant per
+    request) so it's a stricter ceiling.  The trade-off is whether to gate
+    based on what's left to do (admission_overcommit) or what could ever be
+    needed (this).  Stricter usually = fewer preemptions but more queue wait.
+    """
+    free = block_pool.get_num_free_blocks()
+    total = getattr(block_pool, "num_gpu_blocks", None)
+    if total is None or total <= 0:
+        return False
+    peak_reserved = 0
+    for req in running_reqs:
+        expected = _oracle_resolve(req)
+        peak_reserved += (expected + block_size - 1) // block_size
+    capacity = int(total * (1.0 - _PROBE_ADMISSION_MARGIN))
+    return peak_reserved > capacity
+
+
+def _oracle_pred_admission_should_refuse(running_reqs, block_pool, block_size):
+    """Predictive admission: simulate KV trajectory for H steps and refuse if
+    peak utilization exceeds capacity AND no cheap victim is available.
+
+    Per-step model: each running request grows by 1 token (i.e. ceil(steps/block_size)
+    new blocks in H steps).  We project total blocks needed at horizon H,
+    compare to capacity, and refuse if overflow predicted unless a cheap
+    victim could absorb it.
+    """
+    free = block_pool.get_num_free_blocks()
+    total = getattr(block_pool, "num_gpu_blocks", None) or (free * 2)
+    if free <= 0:
+        return True
+    H = _PROBE_PRED_HORIZON_STEPS
+    # Sum projected additional blocks: each running request grows by min(remaining, H) tokens
+    projected_growth = 0
+    for req in running_reqs:
+        exp = _oracle_resolve(req)
+        rem = max(0, exp - req.num_output_tokens)
+        # Within horizon, request decodes at most min(rem, H) more tokens
+        gain = min(rem, H)
+        projected_growth += (gain + block_size - 1) // block_size
+    used = total - free
+    projected_peak = used + projected_growth
+    if projected_peak <= total * (1.0 - _PROBE_ADMISSION_MARGIN):
+        return False  # no overflow predicted within horizon
+    if not running_reqs:
+        return True
+    # Overflow predicted: check if a cheap victim is available
+    best_score = max(_probe_g_oracle_co(r) for r in running_reqs)  # uses static β=PROBE_PREEMPT_BETA
+    return best_score < _PROBE_ADMIT_THRESHOLD
+
+
+def _probe_g_oracle_co(request) -> float:
+    """Cost-aware oracle score: penalises decoded work to protect sunk cost.
+
+    score = (expected_total - decoded) - beta * decoded
+          = expected_total - (1 + beta) * decoded
+
+    Higher score = better preempt victim (long remaining + low decoded).
+    With beta=0 this is identical to _probe_g_oracle. Larger beta protects
+    high-progress requests more aggressively.
+    """
+    expected_total = _oracle_resolve(request)
+    decoded = request.num_output_tokens
+    return float(expected_total - (1.0 + _PROBE_PREEMPT_BETA) * decoded)
+
+
+def _probe_g_longest_remaining(request) -> float:
+    """P1: argmax(expected_total - decoded). Picks the request with the most
+    decode work still to do. Derived from §4.2 of eviction_economics.md as the
+    profit-maximising victim under throughput-bound DISCARD: evicting it frees
+    KV blocks that would otherwise be tied up for the longest natural duration.
+    Has no no-oracle equivalent."""
+    return float(max(0, _oracle_resolve(request) - request.num_output_tokens))
+
+
+def _probe_g_kv_remaining_product(request) -> float:
+    """P2: argmax(K_R · remaining). Full §4.3 ROI score: balances current KV
+    footprint (block-seconds freed per eviction) with remaining work (so we
+    don't evict near-done requests)."""
+    decoded = request.num_output_tokens
+    expected = _oracle_resolve(request)
+    remaining = max(0, expected - decoded)
+    kv = len(request.prompt_token_ids) + decoded
+    return float(kv * remaining)
+
+
+def _probe_g_kv_remaining_co(request) -> float:
+    """P2-v2: K_R · (E − (1+β)·N). Combines kv_remaining_product's K-weighting
+    with oracle_co's sunk-cost discount.
+
+    Reasoning:
+      P2 (kv_remaining_product) wins at low λ by picking the most "valuable to
+      free" victim (big K_R × long remaining) — but it has the highest C per
+      preempt of any policy, so under SLO discipline it breaks down past
+      λ=0.035. The score below adds oracle_co's sunk-cost penalty:
+
+          score = K_R · (E − (1+β)·N)
+
+      At N = 0 this reduces to K · E (full kv_remaining_product weight).
+      At N = E/(1+β) the second factor is 0 (request becomes ineligible).
+      At N > E/(1+β) the score is negative (request is filtered out).
+
+      With β = PROBE_PREEMPT_BETA (default 1.0):
+        - threshold for ineligibility is N > E/2 (50% done)
+        - protects near-completion victims absolutely
+        - retains K-weighted choice among low-progress candidates
+
+      Predicted behaviour:
+        - λ=0.030: ~identical to P2 (most candidates have N ≪ E/2 anyway)
+        - λ=0.035-0.040: lower C than P2 (eligible set excludes mid-progress
+          requests), should stay Tier-1 longer
+        - λ=0.045: behaves closer to longest_remaining with K-weight
+    """
+    decoded = request.num_output_tokens
+    expected = _oracle_resolve(request)
+    kv = len(request.prompt_token_ids) + decoded
+    # second factor goes through zero at N = E/(1+β), then negative
+    cost_adjusted_remaining = expected - (1.0 + _PROBE_PREEMPT_BETA) * decoded
+    return float(kv * cost_adjusted_remaining)
+
+
+# Cap on per-request preempt count (anti-thrash shield / §8-B). After a request
+# has been preempted >= MAX times it becomes INELIGIBLE for further preempt
+# (the score function dispatch filters it out before argmax). This breaks the
+# cascade attractor that all length-aware victim functions are vulnerable to
+# (rev-4 scratch pad finding). Set 0 to disable (default 4).
+_PROBE_MAX_PREEMPTS_PER_REQ: int = int(os.environ.get("PROBE_MAX_PREEMPTS_PER_REQ", "4"))
+
+# Near-completion shield (§8-A). When >0, requests whose entropy-spike predictor
+# says they have fewer than K remaining tokens become INELIGIBLE for preempt.
+# Only fires when the predictor is active (num_computed >= MIN_DECODED).
+# Set 0 to disable (default 0 = off).
+_PROBE_SHIELD_NEAR_COMPLETE_K: int = int(
+    os.environ.get("PROBE_SHIELD_NEAR_COMPLETE_K", "0")
+)
+
+# Whether the default LIFO branch (PROBE_VICTIM=default) should apply the
+# shield filters. Off by default to preserve baseline LIFO behavior;
+# opt-in via PROBE_DEFAULT_LIFO_SHIELD=1 in the `default_ab` recipe.
+_PROBE_DEFAULT_LIFO_SHIELD: bool = (
+    os.environ.get("PROBE_DEFAULT_LIFO_SHIELD", "0").lower()
+    not in ("0", "false", "no", "")
+)
+
+
+def _near_completion(r) -> bool:
+    """True if the predictor says this request is within K tokens of finishing
+    and PROBE_SHIELD_NEAR_COMPLETE_K is set. Returns False when the predictor
+    has no signal yet (num_computed < MIN_DECODED) so early-stage requests
+    aren't falsely shielded by the fallback constant."""
+    if _PROBE_SHIELD_NEAR_COMPLETE_K <= 0:
+        return False
+    n = r.num_computed_tokens
+    if n < _SPIKE_E_MIN_DECODED:
+        return False
+    e_hat = _spike_estimate_E(r)
+    return (e_hat - n) < _PROBE_SHIELD_NEAR_COMPLETE_K
+
+
+def _eligible_for_preempt(running):
+    """Filter running pool to requests that haven't hit the per-request preempt
+    cap (§8-B) AND aren't predicted to be near completion (§8-A).
+    Falls back to the full pool if every request is shielded (rare but possible
+    at deep saturation — we still need to preempt SOMEONE)."""
+    eligible = running
+    if _PROBE_MAX_PREEMPTS_PER_REQ > 0:
+        eligible = [r for r in eligible
+                    if getattr(r, "num_preemptions", 0) < _PROBE_MAX_PREEMPTS_PER_REQ]
+    if _PROBE_SHIELD_NEAR_COMPLETE_K > 0:
+        eligible = [r for r in eligible if not _near_completion(r)]
+    return eligible if eligible else running
+
+
+# S2 online length predictor coefficients (fitted on round-1 calibration data
+# at checkpoint cp=2048; see docs/scratch_pad.md). Tunable via env vars so we
+# can swap in fits from longer or shorter trajectories.
+_SPIKE_E_INTERCEPT: float = float(os.environ.get("PROBE_SPIKE_E_INTERCEPT", "8.55"))
+_SPIKE_E_SLOPE: float = float(os.environ.get("PROBE_SPIKE_E_SLOPE", "6.08"))
+# 2-feature spike+zero predictor: adds near_zero_rate term. Defaults to 0.0 so
+# the 1-feature spike-only predictor is preserved when this env var is unset.
+# On HLE, spike-only has r≈0 but spike+zero recovers r≈0.39 (see scratch_pad §15).
+_SPIKE_E_ZERO_SLOPE: float = float(os.environ.get("PROBE_SPIKE_E_ZERO_SLOPE", "0.0"))
+_SPIKE_E_MIN_DECODED: int = int(os.environ.get("PROBE_SPIKE_E_MIN_DECODED", "256"))
+_SPIKE_E_FALLBACK: int = int(os.environ.get("PROBE_SPIKE_E_FALLBACK", "12760"))
+# Gate mode for early-stage requests (N < MIN_DECODED):
+#   "constant"  — return _SPIKE_E_FALLBACK (legacy behavior; fits AIME's long decodes)
+#   "gate"      — return N+1, marking the request as "no signal yet"; co-design
+#                 score formula then makes them ineligible (E-(1+β)·N goes negative
+#                 for any non-trivial N). Recommended for short-decode workloads
+#                 like GSM8K where the constant fallback wildly inflates early-stage E.
+_SPIKE_E_GATE_MODE: str = os.environ.get("PROBE_SPIKE_E_GATE_MODE", "constant")
+
+
+def _spike_estimate_E(request) -> int:
+    """Online entropy-spike length predictor (paper-deployable; no offline calib).
+
+    T̂ = exp(a + b · spike_count / num_computed)  when num_computed ≥ MIN_DECODED
+    else either FALLBACK constant or a gate value (PROBE_SPIKE_E_GATE_MODE).
+
+    Coefficients fit on round-1 AIME calibration data (n=2312 stop/length
+    completions joined with entropy.jsonl per-token entropy): a=8.55, b=6.08
+    at cp=2048, R²=0.29, MAPE ≈ 46%, AUC@10K = 0.79.
+
+    Result is clamped to at least N+1 (a request can never have fewer remaining
+    tokens than already decoded) so the score functions don't get negative
+    "remaining" inputs from a noisy predictor.
+    """
+    import math as _math
+    N = request.num_computed_tokens
+    if N < _SPIKE_E_MIN_DECODED:
+        if _SPIKE_E_GATE_MODE == "gate":
+            return N + 1
+        return _SPIKE_E_FALLBACK
+    rate = getattr(request, "probe_spike_count", 0) / N
+    log_T = _SPIKE_E_INTERCEPT + _SPIKE_E_SLOPE * rate
+    if _SPIKE_E_ZERO_SLOPE != 0.0:
+        zero_rate = getattr(request, "probe_near_zero_count", 0) / N
+        log_T += _SPIKE_E_ZERO_SLOPE * zero_rate
+    T_hat = _math.exp(log_T)
+    return int(max(T_hat, N + 1))
+
+
+def _probe_g_kv_remaining_co_entropy(request) -> float:
+    """Same victim score as kv_remaining_co (cost-aware K_R·(E−(1+β)·N))
+    but with E sourced from the S2 online entropy-spike predictor instead
+    of the offline oracle. This is the deployment-grade version of the
+    method — no per-workload calibration required.
+    """
+    decoded = request.num_output_tokens
+    expected = _spike_estimate_E(request)
+    kv = len(request.prompt_token_ids) + decoded
+    cost_adjusted_remaining = expected - (1.0 + _PROBE_PREEMPT_BETA) * decoded
+    return float(kv * cost_adjusted_remaining)
+
+
+def _probe_g_entropy_remaining(request) -> float:
+    """Pure remaining-decode (no co-design): argmax(E − N), with E from the
+    S2 entropy-spike predictor. Mirror of _probe_g_longest_remaining but using
+    the online predictor instead of the oracle. Strips out the (P+N) prefix
+    K-weight and the (1+β) sunk-cost discount used in kv_remaining_co_entropy.
+    """
+    expected = _spike_estimate_E(request)
+    decoded = request.num_output_tokens
+    return float(max(0, expected - decoded))
+
+
+def _probe_g_entropy_least_remaining(request) -> float:
+    """SJF mirror of _probe_g_entropy_remaining: argmax(N − E) = preempt the
+    request closest to finishing (most decoded relative to predicted total).
+    Direction-flip experiment per scratch_pad_slo.md §19. Predicted to be
+    anti-pattern because preempting near-completion wastes max sunk compute.
+    """
+    expected = _spike_estimate_E(request)
+    decoded = request.num_output_tokens
+    return float(decoded - expected)
+
+
+def _probe_g_oracle_least_remaining(request) -> float:
+    """SJF mirror of _probe_g_oracle: argmax(N − E_true). Perfect-knowledge
+    direction-flip — preempt the request truly closest to completion."""
+    expected = _oracle_resolve(request)
+    decoded = request.num_output_tokens
+    return float(decoded - expected)
+
+
+def _probe_g_kv_least_remaining_co_entropy(request) -> float:
+    """SJF + KV co-design mirror of _probe_g_kv_remaining_co_entropy.
+    score = K_R · ((1+β)·N − E)  (sign-flipped LJF co-design)
+    argmax picks: big-KV + high decoded + low predicted = "predictor-overrun
+    weighted by capacity gain". See scratch_pad_slo §19h Design A.
+    """
+    decoded = request.num_output_tokens
+    expected = _spike_estimate_E(request)
+    kv = len(request.prompt_token_ids) + decoded
+    cost_adjusted_overrun = (1.0 + _PROBE_PREEMPT_BETA) * decoded - expected
+    return float(kv * cost_adjusted_overrun)
+
+
+def _probe_g_kv_least_remaining_co_oracle(request) -> float:
+    """SJF + KV co-design with perfect knowledge. Mirror of _probe_g_oracle_co.
+    score = (expected − (1+β)·decoded) flipped: ((1+β)·decoded − expected) × kv
+    """
+    decoded = request.num_output_tokens
+    expected = _oracle_resolve(request)
+    kv = len(request.prompt_token_ids) + decoded
+    cost_adjusted_overrun = (1.0 + _PROBE_PREEMPT_BETA) * decoded - expected
+    return float(kv * cost_adjusted_overrun)
+
+
+def _probe_g_kv_remaining_swapaware_entropy(request) -> float:
+    """Offload-mode-tuned victim score: KV · [1 − β · C / (remaining + ε)].
+
+    Uses the S2 entropy-spike predictor for remaining-decode-length. Differs
+    from kv_remaining_co_entropy in cost model — designed for OFFLOAD mode
+    where preempted KV is paged to CPU (no recompute cost), so the dominant
+    eviction cost is the swap-back transfer + scheduling delay.
+
+    Near-done requests have small (remaining), so the bracket goes strongly
+    negative — they are protected from eviction (let them finish). Long-
+    remaining requests have large (remaining), bracket → 1 — they expose
+    full KV value, freely evictable.
+    """
+    decoded = request.num_output_tokens
+    expected = _spike_estimate_E(request)
+    kv = len(request.prompt_token_ids) + decoded
+    remaining = max(1, expected - decoded)
+    swap_back_p = min(1.0, _PROBE_SWAP_C / remaining)
+    return float(kv * (1.0 - _PROBE_PREEMPT_BETA * swap_back_p))
+
+
+def _probe_g_age_weighted(request) -> float:
+    """P4: KV-remaining-product divided by 1 + num_preemptions.
+    Anti-starvation: deprioritise requests that have already been preempted."""
+    decoded = request.num_output_tokens
+    expected = _oracle_resolve(request)
+    remaining = max(0, expected - decoded)
+    kv = len(request.prompt_token_ids) + decoded
+    age = 1 + getattr(request, "num_preemptions", 0)
+    return float((kv * remaining) / age)
+
+
+def _probe_g_longest_decoded(request) -> float:
+    """P5: argmax(num_computed_tokens). Largest current KV footprint by
+    decoded length only (ignores prompt). Predicted to win on bimodal
+    workloads by routing preempt pressure to long-decode jobs and protecting
+    short jobs from thrash."""
+    return float(request.num_computed_tokens)
+
+
+def _oracle_co_admission_should_refuse(running_reqs, block_pool, block_size: int) -> bool:
+    """Co-designed admission check.
+
+    Refuse admission only when:
+      (a) the in-flight pool's projected remaining KV demand exceeds free blocks
+          (preemption would be forced if we admit), AND
+      (b) no acceptable victim exists — i.e. max_co_score across running
+          requests is below ADMIT_THRESHOLD (all candidates would be costly to
+          evict because they're all high-progress).
+
+    If pool has headroom OR there's a cheap victim available, admit.
+    """
+    if not _ORACLE_LOOKUP and _PROBE_ADMISSION == "oracle_co":
+        _oracle_load_if_needed()
+    free_blocks = block_pool.get_num_free_blocks()
+    if free_blocks <= 0:
+        return True
+    projected = 0
+    for req in running_reqs:
+        expected = _oracle_resolve(req)
+        remaining = expected - req.num_output_tokens
+        if remaining > 0:
+            projected += (remaining + block_size - 1) // block_size
+    available = max(1, int(free_blocks * (1.0 - _PROBE_ADMISSION_MARGIN)))
+    if projected <= available:
+        # Pool will fit naturally — admit.
+        return False
+    # Pool would overflow. Check if a cheap victim exists.
+    if not running_reqs:
+        return True
+    best_score = max(_probe_g_oracle_co(r) for r in running_reqs)
+    return best_score < _PROBE_ADMIT_THRESHOLD
+
+
+def _oracle_co_lifo_admission_should_refuse(running_reqs, block_pool, block_size: int) -> bool:
+    """LIFO-aware admission gate (mirror of oracle_co_sf for the default victim).
+
+    vLLM's default preempt is `running.pop()` — the most-recently-admitted
+    in-flight request. Refuse admission if that victim still has long
+    expected remaining decode work (high recompute cost on DISCARD).
+    """
+    if not _ORACLE_LOOKUP and _PROBE_ADMISSION == "oracle_co_lifo":
+        _oracle_load_if_needed()
+    free_blocks = block_pool.get_num_free_blocks()
+    if free_blocks <= 0:
+        return True
+    projected = 0
+    for req in running_reqs:
+        expected = _oracle_resolve(req)
+        remaining = expected - req.num_output_tokens
+        if remaining > 0:
+            projected += (remaining + block_size - 1) // block_size
+    available = max(1, int(free_blocks * (1.0 - _PROBE_ADMISSION_MARGIN)))
+    if projected <= available:
+        return False
+    if not running_reqs:
+        return True
+    lifo_victim = running_reqs[-1]
+    lifo_victim_remaining = max(0, _oracle_resolve(lifo_victim) - lifo_victim.num_output_tokens)
+    return lifo_victim_remaining > _PROBE_ADMIT_SF_REMAINING_MAX
+
+
+def _oracle_co_il_admission_should_refuse(running_reqs, block_pool, block_size: int) -> bool:
+    """input_length-aware admission gate (mirror of oracle_co_sf for IL victim).
+
+    input_length preempt selects argmax(len(prompt_token_ids)). Refuse
+    admission if the IL-chosen victim's expected remaining is large.
+    """
+    if not _ORACLE_LOOKUP and _PROBE_ADMISSION == "oracle_co_il":
+        _oracle_load_if_needed()
+    free_blocks = block_pool.get_num_free_blocks()
+    if free_blocks <= 0:
+        return True
+    projected = 0
+    for req in running_reqs:
+        expected = _oracle_resolve(req)
+        remaining = expected - req.num_output_tokens
+        if remaining > 0:
+            projected += (remaining + block_size - 1) // block_size
+    available = max(1, int(free_blocks * (1.0 - _PROBE_ADMISSION_MARGIN)))
+    if projected <= available:
+        return False
+    if not running_reqs:
+        return True
+    il_victim = max(running_reqs, key=lambda r: len(r.prompt_token_ids))
+    il_victim_remaining = max(0, _oracle_resolve(il_victim) - il_victim.num_output_tokens)
+    return il_victim_remaining > _PROBE_ADMIT_SF_REMAINING_MAX
+
+
+def _oracle_co_lr_admission_should_refuse(running_reqs, block_pool, block_size: int) -> bool:
+    """LR-aware admission gate (mirror of oracle_co_sf for the longest_remaining victim).
+
+    Refuse admission only when overflow is projected AND the LR-chosen victim
+    (argmax remaining) has remaining work below the admit-cost threshold —
+    i.e. when admitting now would force the policy to evict a request whose
+    remaining work is small relative to recompute cost, i.e. a poor trade.
+    """
+    if not _ORACLE_LOOKUP and _PROBE_ADMISSION == "oracle_co_lr":
+        _oracle_load_if_needed()
+    free_blocks = block_pool.get_num_free_blocks()
+    if free_blocks <= 0:
+        return True
+    projected = 0
+    for req in running_reqs:
+        expected = _oracle_resolve(req)
+        remaining = expected - req.num_output_tokens
+        if remaining > 0:
+            projected += (remaining + block_size - 1) // block_size
+    available = max(1, int(free_blocks * (1.0 - _PROBE_ADMISSION_MARGIN)))
+    if projected <= available:
+        return False
+    if not running_reqs:
+        return True
+    # LR victim = argmax remaining; refuse if even that "best" victim isn't worth evicting.
+    lr_victim = max(running_reqs, key=lambda r: _oracle_resolve(r) - r.num_output_tokens)
+    lr_remaining = max(0, _oracle_resolve(lr_victim) - lr_victim.num_output_tokens)
+    # Refuse when the LR victim's remaining is BELOW threshold — i.e. the
+    # cheapest-to-keep victim is also near-done and shouldn't be evicted.
+    return lr_remaining < _PROBE_ADMIT_SF_REMAINING_MAX
+
+
+def _oracle_co_sf_admission_should_refuse(running_reqs, block_pool, block_size: int) -> bool:
+    """SF-aware admission gate.
+
+    The shortest_first preempt selects argmin(num_computed_tokens) — i.e. the
+    freshest request — as its victim, regardless of expected_total. The vanilla
+    oracle_co gate asks "does ANY running request look like a cheap victim?";
+    that's a weak filter when paired with SF because SF will not evict the
+    chosen "cheap" one — it evicts the freshest one, which often has long
+    expected work ahead. This gate computes what SF would actually pick and
+    refuses admission if that victim's expected remaining is large.
+    """
+    if not _ORACLE_LOOKUP and _PROBE_ADMISSION == "oracle_co_sf":
+        _oracle_load_if_needed()
+    free_blocks = block_pool.get_num_free_blocks()
+    if free_blocks <= 0:
+        return True
+    projected = 0
+    for req in running_reqs:
+        expected = _oracle_resolve(req)
+        remaining = expected - req.num_output_tokens
+        if remaining > 0:
+            projected += (remaining + block_size - 1) // block_size
+    available = max(1, int(free_blocks * (1.0 - _PROBE_ADMISSION_MARGIN)))
+    if projected <= available:
+        return False
+    if not running_reqs:
+        return True
+    sf_victim = min(running_reqs, key=lambda r: r.num_computed_tokens)
+    sf_victim_remaining = max(0, _oracle_resolve(sf_victim) - sf_victim.num_output_tokens)
+    return sf_victim_remaining > _PROBE_ADMIT_SF_REMAINING_MAX
+
+
+def _entropy_co_sf_admission_should_refuse(running_reqs, block_pool, block_size: int) -> bool:
+    """Deployment-grade twin of `_oracle_co_sf_admission_should_refuse`:
+    same logic, but uses the S2 online entropy-spike length predictor
+    instead of the offline oracle. No calibration required.
+
+    Refuses admission only when:
+      (a) projected remaining KV demand (sum over running) > free_blocks, AND
+      (b) the SF would-be victim (argmin num_computed) has predicted remaining
+          > PROBE_ADMIT_SF_REMAINING_MAX — i.e. SF preempt would target a request
+          with lots of expected work, making the preempt expensive.
+    """
+    free_blocks = block_pool.get_num_free_blocks()
+    if free_blocks <= 0:
+        return True
+    projected = 0
+    for req in running_reqs:
+        expected = _spike_estimate_E(req)
+        remaining = expected - req.num_output_tokens
+        if remaining > 0:
+            projected += (remaining + block_size - 1) // block_size
+    available = max(1, int(free_blocks * (1.0 - _PROBE_ADMISSION_MARGIN)))
+    if projected <= available:
+        return False
+    if not running_reqs:
+        return True
+    sf_victim = min(running_reqs, key=lambda r: r.num_computed_tokens)
+    sf_victim_remaining = max(0, _spike_estimate_E(sf_victim) - sf_victim.num_output_tokens)
+    return sf_victim_remaining > _PROBE_ADMIT_SF_REMAINING_MAX
+
+
+def _entropy_co_admission_should_refuse(running_reqs, block_pool, block_size: int) -> bool:
+    """Entropy analog of `_oracle_co_admission_should_refuse` (generic gate,
+    not SF-aware). Refuses admission only when:
+      (a) projected remaining KV demand > free_blocks, AND
+      (b) no acceptable victim exists — max entropy-co score across running
+          requests is below ADMIT_THRESHOLD.
+    """
+    free_blocks = block_pool.get_num_free_blocks()
+    if free_blocks <= 0:
+        return True
+    projected = 0
+    for req in running_reqs:
+        expected = _spike_estimate_E(req)
+        remaining = expected - req.num_output_tokens
+        if remaining > 0:
+            projected += (remaining + block_size - 1) // block_size
+    available = max(1, int(free_blocks * (1.0 - _PROBE_ADMISSION_MARGIN)))
+    if projected <= available:
+        return False
+    if not running_reqs:
+        return True
+    best_score = max(_probe_g_kv_remaining_co_entropy(r) for r in running_reqs)
+    return best_score < _PROBE_ADMIT_THRESHOLD
+
+
+def _oracle_admission_overcommit(running_reqs, block_pool, block_size: int) -> bool:
+    """Returns True if the projected remaining KV demand of the in-flight
+    pool exceeds free blocks (minus a margin for the would-be arrival).
+
+    For each running request, oracle says how many more tokens it'll generate;
+    we convert to additional blocks and sum.  If sum > free*(1-margin), refuse
+    admission this step — let the in-flight pool drain rather than admit a
+    new request that will trigger preemption.
+    """
+    if not _ORACLE_LOOKUP and _PROBE_ADMISSION == "oracle":
+        _oracle_load_if_needed()
+    free_blocks = block_pool.get_num_free_blocks()
+    if free_blocks <= 0:
+        return True
+    projected = 0
+    for req in running_reqs:
+        expected_total = _oracle_resolve(req)
+        remaining = expected_total - req.num_output_tokens
+        if remaining > 0:
+            projected += (remaining + block_size - 1) // block_size
+    available = max(1, int(free_blocks * (1.0 - _PROBE_ADMISSION_MARGIN)))
+    return projected > available
+
+
+def _probe_g_slope(request) -> float:  # type: ignore[return]
+    """Victim score for probe_slope (P3): log-length × fast-EMA-entropy + slope bonus.
+
+    log(1+len) de-biases long sequences that have already entered low-entropy
+    (converging) phase.  fast_ema_h (α=0.3) detects the entropy cliff in ~7
+    tokens.  Slope bonus λ·max(fast_h−slow_h,0) boosts sequences still
+    actively expanding into exploration.
+    """
+    fast_h = request.probe_ema_h_fast
+    slow_h = request.probe_ema_h
+    base = (math.log1p(request.num_computed_tokens) * fast_h
+            / (_PROBE_H_MAX - fast_h + _PROBE_EPS))
+    slope_bonus = _PROBE_SLOPE_LAMBDA * max(fast_h - slow_h, 0.0)
+    return base + slope_bonus
+
+
+def _probe_g_peos(request) -> float:  # type: ignore[return]
+    """P3 ablation using P(EOS) instead of token entropy (A1).
+
+    g_peos = log(1+len) × (1 - fast_p_eos) / (fast_p_eos + ε)
+           + λ × max(slow_p_eos - fast_p_eos, 0)
+
+    High P(EOS) → model wants to stop → low remaining growth → low score.
+    Slope bonus fires when fast_p_eos drops below slow (p_eos declining ≡
+    entropy rising), identical semantics to P3's entropy slope penalty.
+    """
+    fast_p = request.probe_ema_p_eos_fast
+    slow_p = request.probe_ema_p_eos
+    base = (math.log1p(request.num_computed_tokens) * (1.0 - fast_p)
+            / (fast_p + _PROBE_EPS))
+    slope_bonus = _PROBE_SLOPE_LAMBDA * max(slow_p - fast_p, 0.0)
+    return base + slope_bonus
+
+
+def _probe_g_slope_b(request) -> float:
+    """P3b: identical scorer to P3; improvement is warm EMA init in Request.__init__."""
+    return _probe_g_slope(request)
+
+
+def _probe_g_slope_c(request) -> float:
+    """P3c: P3 with pressure-adaptive λ — slope bonus scales to zero under extreme KV load.
+
+    λ_eff = λ at kv_util ≤ LAM_LOW (0.80); 0 at kv_util ≥ LAM_HIGH (0.95).
+    Prevents P3's entropy-protection from causing head-of-line blocking above N*.
+    Reads _probe_kv_pressure, updated each schedule() step.
+    """
+    fast_h = request.probe_ema_h_fast
+    slow_h = request.probe_ema_h
+    base = (math.log1p(request.num_computed_tokens) * fast_h
+            / (_PROBE_H_MAX - fast_h + _PROBE_EPS))
+    lam_eff = _PROBE_SLOPE_LAMBDA * max(
+        0.0,
+        1.0 - (_probe_kv_pressure - _PROBE_ADAPTIVE_LAM_LOW)
+              / (_PROBE_ADAPTIVE_LAM_HIGH - _PROBE_ADAPTIVE_LAM_LOW),
+    )
+    return base + lam_eff * max(fast_h - slow_h, 0.0)
+
+
+def _probe_g_slope_e(request) -> float:
+    """P3e: symmetric slope — bonus for rising entropy, discount for falling entropy.
+
+    Adds -γ·max(slow_h - fast_h, 0) to make actively-converging sequences
+    easier to evict, symmetric with the existing exploration bonus.
+    """
+    fast_h = request.probe_ema_h_fast
+    slow_h = request.probe_ema_h
+    base = (math.log1p(request.num_computed_tokens) * fast_h
+            / (_PROBE_H_MAX - fast_h + _PROBE_EPS))
+    slope_bonus = _PROBE_SLOPE_LAMBDA * max(fast_h - slow_h, 0.0)
+    convergence_discount = _PROBE_SLOPE_GAMMA * max(slow_h - fast_h, 0.0)
+    return base + slope_bonus - convergence_discount
+
+
+def _probe_g_slope_f(request) -> float:
+    """P3f: entropy + P(EOS) fusion — P(EOS) used as a convergence detector on top of entropy.
+
+    Subtracts δ·fast_ema_p_eos from the entropy score. High P(EOS) signals
+    imminent termination; reduces victim score independent of entropy level.
+    Leverages the P(EOS) signal already extracted for the A1 ablation.
+    """
+    fast_h = request.probe_ema_h_fast
+    slow_h = request.probe_ema_h
+    base = (math.log1p(request.num_computed_tokens) * fast_h
+            / (_PROBE_H_MAX - fast_h + _PROBE_EPS))
+    slope_bonus = _PROBE_SLOPE_LAMBDA * max(fast_h - slow_h, 0.0)
+    peos_discount = _PROBE_PEOS_DELTA * request.probe_ema_p_eos_fast
+    return base + slope_bonus - peos_discount
+
+
+def _probe_g_slope_g(request) -> float:
+    """P3g: peak-entropy tracking — discounts sequences that have fallen below their own peak.
+
+    Multiplies base+slope by exp(-β · peak_gap / H_max) where peak_gap is how
+    far fast_h has dropped below the sequence's maximum observed entropy.
+    Sequences still near their peak are fully protected; sequences well past
+    their peak (answer-writing phase) are heavily discounted.
+    """
+    fast_h = request.probe_ema_h_fast
+    slow_h = request.probe_ema_h
+    peak_h = request.probe_peak_h
+    base = (math.log1p(request.num_computed_tokens) * fast_h
+            / (_PROBE_H_MAX - fast_h + _PROBE_EPS))
+    slope_bonus = _PROBE_SLOPE_LAMBDA * max(fast_h - slow_h, 0.0)
+    peak_gap = max(peak_h - fast_h, 0.0)
+    peak_discount = math.exp(-_PROBE_PEAK_BETA * peak_gap / _PROBE_H_MAX)
+    return (base + slope_bonus) * peak_discount
+
+
+def _probe_g_slope_e2(request) -> float:
+    """P3e-γ0.2: symmetric slope with lighter convergence discount (γ=0.2 vs 0.5).
+
+    Reduces N=84-88 clogging observed with γ=0.5 while retaining the N=76-80
+    signal improvement. Hardcoded to avoid per-run env var contamination.
+    """
+    fast_h = request.probe_ema_h_fast
+    slow_h = request.probe_ema_h
+    base = (math.log1p(request.num_computed_tokens) * fast_h
+            / (_PROBE_H_MAX - fast_h + _PROBE_EPS))
+    slope_bonus = _PROBE_SLOPE_LAMBDA * max(fast_h - slow_h, 0.0)
+    convergence_discount = 0.2 * max(slow_h - fast_h, 0.0)
+    return base + slope_bonus - convergence_discount
+
+
+def _probe_g_slope_e1(request) -> float:
+    """P3e-γ0.1: symmetric slope with minimal convergence discount (γ=0.1).
+
+    Most conservative tuning — intended to preserve P3's N=84-88 behaviour
+    while testing whether any convergence signal benefit survives at N=76-80.
+    """
+    fast_h = request.probe_ema_h_fast
+    slow_h = request.probe_ema_h
+    base = (math.log1p(request.num_computed_tokens) * fast_h
+            / (_PROBE_H_MAX - fast_h + _PROBE_EPS))
+    slope_bonus = _PROBE_SLOPE_LAMBDA * max(fast_h - slow_h, 0.0)
+    convergence_discount = 0.1 * max(slow_h - fast_h, 0.0)
+    return base + slope_bonus - convergence_discount
+
+
+def _probe_g_slope_c2(request) -> float:
+    """P3c-LAM88: pressure-adaptive λ with higher activation threshold (LAM_LOW=0.88).
+
+    Preserves full λ until KV utilization reaches 88% (vs 80% in P3c), keeping
+    P3's entropy discrimination active deeper into the pressure zone. λ reaches
+    zero at 95% util (same high end as P3c).
+    """
+    fast_h = request.probe_ema_h_fast
+    slow_h = request.probe_ema_h
+    base = (math.log1p(request.num_computed_tokens) * fast_h
+            / (_PROBE_H_MAX - fast_h + _PROBE_EPS))
+    lam_eff = _PROBE_SLOPE_LAMBDA * max(
+        0.0,
+        1.0 - (_probe_kv_pressure - 0.88) / (_PROBE_ADAPTIVE_LAM_HIGH - 0.88),
+    )
+    return base + lam_eff * max(fast_h - slow_h, 0.0)
+
+
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
     ECConnectorMetadata,
@@ -181,6 +1386,18 @@ class Scheduler(SchedulerInterface):
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
+
+        # PROBE proactive offload: requests in PRE_OFFLOADING state.
+        # GPU blocks are freed to the draining pool immediately; the
+        # offloading connector is streaming KV to CPU.  The draining blocks
+        # are released to the free queue once finished_sending is received.
+        self._probe_pre_offloading: dict[str, Request] = {}
+        # Reactive-offload (PROBE_REACTIVE_OFFLOAD): set of req_ids that
+        # entered PRE_OFFLOADING this step.  Drained into
+        # scheduler_output.proactive_preempted_req_ids and cleared each step.
+        self._step_proactive_preempts: set[str] = set()
+        # Block IDs currently in draining pool (per proactive pre-offload).
+        self._probe_drain_block_ids: dict[str, list[int]] = {}
 
         # Encoder-related.
         # Calculate encoder cache size if applicable
@@ -380,6 +1597,24 @@ class Scheduler(SchedulerInterface):
 
         self.kv_cache_manager.new_step_starts()
 
+        # PROBE P3c / P4: update KV-pressure globals every step.
+        if _PROBE_VICTIM in ("probe_slope_c", "probe_slope_c2", "probe_slope_ring"):
+            global _probe_kv_pressure, _probe_kv_ema, _probe_ring_active
+            _bp_tot = self.kv_cache_manager.block_pool.num_gpu_blocks
+            if _bp_tot > 0:
+                _bp_free = self.kv_cache_manager.block_pool.get_num_free_blocks()
+                _inst_p = 1.0 - _bp_free / _bp_tot
+                _probe_kv_pressure = _inst_p  # P3c: instantaneous utilization
+                if _PROBE_VICTIM == "probe_slope_ring":
+                    _probe_kv_ema = (_PROBE_KV_EMA_ALPHA * _inst_p
+                                     + (1.0 - _PROBE_KV_EMA_ALPHA) * _probe_kv_ema)
+            # P4 hysteresis gate.
+            if _PROBE_VICTIM == "probe_slope_ring":
+                if not _probe_ring_active and _probe_kv_ema >= _PROBE_SLOPE_RING_ACTIVATE:
+                    _probe_ring_active = True
+                elif _probe_ring_active and _probe_kv_ema < _PROBE_SLOPE_RING_DEACTIVATE:
+                    _probe_ring_active = False
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -496,8 +1731,378 @@ class Scheduler(SchedulerInterface):
                                 )
                                 encoder_compute_budget += num_embeds_to_restore
                             req_index -= 1
+                    elif _PROBE_VICTIM in (
+                        "oracle", "oracle_co", "oracle_co_adapt", "oracle_co_pred",
+                        "oracle_smart_lifo",
+                        "longest_remaining", "kv_remaining_product",
+                        "kv_remaining_co", "kv_remaining_co_entropy",
+                        "kv_remaining_swapaware_entropy",
+                        "entropy_remaining",
+                        "entropy_least_remaining", "oracle_least_remaining",
+                        "entropy_kv_least_remaining_co",
+                        "oracle_kv_least_remaining_co",
+                        "age_weighted_oracle", "longest_decoded",
+                    ):
+                        if _PROBE_VICTIM == "oracle":
+                            score_fn = _probe_g_oracle
+                        elif _PROBE_VICTIM == "oracle_co_adapt":
+                            global _CURRENT_ADAPTIVE_BETA
+                            _CURRENT_ADAPTIVE_BETA = _adaptive_beta(
+                                _kv_utilization(self.kv_cache_manager.block_pool))
+                            score_fn = _probe_g_oracle_co_adapt
+                        elif _PROBE_VICTIM == "oracle_smart_lifo":
+                            score_fn = _probe_g_smart_lifo
+                        elif _PROBE_VICTIM == "longest_remaining":
+                            score_fn = _probe_g_longest_remaining
+                        elif _PROBE_VICTIM == "kv_remaining_product":
+                            score_fn = _probe_g_kv_remaining_product
+                        elif _PROBE_VICTIM == "kv_remaining_co":
+                            score_fn = _probe_g_kv_remaining_co
+                        elif _PROBE_VICTIM == "kv_remaining_co_entropy":
+                            score_fn = _probe_g_kv_remaining_co_entropy
+                        elif _PROBE_VICTIM == "kv_remaining_swapaware_entropy":
+                            score_fn = _probe_g_kv_remaining_swapaware_entropy
+                        elif _PROBE_VICTIM == "entropy_remaining":
+                            score_fn = _probe_g_entropy_remaining
+                        elif _PROBE_VICTIM == "entropy_least_remaining":
+                            score_fn = _probe_g_entropy_least_remaining
+                        elif _PROBE_VICTIM == "oracle_least_remaining":
+                            score_fn = _probe_g_oracle_least_remaining
+                        elif _PROBE_VICTIM == "entropy_kv_least_remaining_co":
+                            score_fn = _probe_g_kv_least_remaining_co_entropy
+                        elif _PROBE_VICTIM == "oracle_kv_least_remaining_co":
+                            score_fn = _probe_g_kv_least_remaining_co_oracle
+                        elif _PROBE_VICTIM == "age_weighted_oracle":
+                            score_fn = _probe_g_age_weighted
+                        elif _PROBE_VICTIM == "longest_decoded":
+                            score_fn = _probe_g_longest_decoded
+                        else:
+                            # oracle_co and oracle_co_pred both use the static-β cost-aware score
+                            score_fn = _probe_g_oracle_co
+                        preempted_req = max(_eligible_for_preempt(self.running), key=score_fn)
+                        _oracle_log_decision(preempted_req, self.running)
+                        self.running.remove(preempted_req)
+                        if preempted_req in scheduled_running_reqs:
+                            preempted_req_id = preempted_req.request_id
+                            scheduled_running_reqs.remove(preempted_req)
+                            token_budget += num_scheduled_tokens.pop(preempted_req_id)
+                            req_to_new_blocks.pop(preempted_req_id)
+                            scheduled_spec_decode_tokens.pop(preempted_req_id, None)
+                            preempted_encoder_inputs = scheduled_encoder_inputs.pop(
+                                preempted_req_id, None
+                            )
+                            if preempted_encoder_inputs:
+                                num_embeds_to_restore = sum(
+                                    preempted_req.get_num_encoder_embeds(i)
+                                    for i in preempted_encoder_inputs
+                                )
+                                encoder_compute_budget += num_embeds_to_restore
+                            req_index -= 1
+                    elif _PROBE_VICTIM == "probe_spike":
+                        preempted_req = max(_eligible_for_preempt(self.running), key=_probe_g_spike)
+                        self.running.remove(preempted_req)
+                        if preempted_req in scheduled_running_reqs:
+                            preempted_req_id = preempted_req.request_id
+                            scheduled_running_reqs.remove(preempted_req)
+                            token_budget += num_scheduled_tokens.pop(preempted_req_id)
+                            req_to_new_blocks.pop(preempted_req_id)
+                            scheduled_spec_decode_tokens.pop(preempted_req_id, None)
+                            preempted_encoder_inputs = scheduled_encoder_inputs.pop(
+                                preempted_req_id, None
+                            )
+                            if preempted_encoder_inputs:
+                                num_embeds_to_restore = sum(
+                                    preempted_req.get_num_encoder_embeds(i)
+                                    for i in preempted_encoder_inputs
+                                )
+                                encoder_compute_budget += num_embeds_to_restore
+                            req_index -= 1
+                    elif _PROBE_VICTIM in (
+                        "probe_slope", "probe_slope_peos",
+                        "probe_slope_b", "probe_slope_c", "probe_slope_e",
+                        "probe_slope_f", "probe_slope_g",
+                        "probe_slope_e2", "probe_slope_e1", "probe_slope_c2",
+                    ):
+                        # PROBE P3 family: entropy-based victim selection.
+                        _score_fn = {
+                            "probe_slope_peos": _probe_g_peos,
+                            "probe_slope_b": _probe_g_slope_b,
+                            "probe_slope_c": _probe_g_slope_c,
+                            "probe_slope_e": _probe_g_slope_e,
+                            "probe_slope_f": _probe_g_slope_f,
+                            "probe_slope_g": _probe_g_slope_g,
+                            "probe_slope_e2": _probe_g_slope_e2,
+                            "probe_slope_e1": _probe_g_slope_e1,
+                            "probe_slope_c2": _probe_g_slope_c2,
+                        }.get(_PROBE_VICTIM, _probe_g_slope)
+                        preempted_req = max(
+                            self.running,
+                            key=_score_fn,
+                        )
+                        self.running.remove(preempted_req)
+                        if preempted_req in scheduled_running_reqs:
+                            preempted_req_id = preempted_req.request_id
+                            scheduled_running_reqs.remove(preempted_req)
+                            token_budget += num_scheduled_tokens.pop(preempted_req_id)
+                            req_to_new_blocks.pop(preempted_req_id)
+                            scheduled_spec_decode_tokens.pop(preempted_req_id, None)
+                            preempted_encoder_inputs = scheduled_encoder_inputs.pop(
+                                preempted_req_id, None
+                            )
+                            if preempted_encoder_inputs:
+                                num_embeds_to_restore = sum(
+                                    preempted_req.get_num_encoder_embeds(i)
+                                    for i in preempted_encoder_inputs
+                                )
+                                encoder_compute_budget += num_embeds_to_restore
+                            req_index -= 1
+                    elif _PROBE_VICTIM == "probe_slope_ring":
+                        # PROBE P4: hysteresis-gated ring with g_slope + sustained pressure.
+                        #
+                        # _probe_ring_active latches on at EMA ≥ 0.90 and off at < 0.85.
+                        # Below the band → pure g_slope (P3 behaviour); ring still books
+                        # samples silently so it warms up before saturation begins.
+                        # Inside the band → state is sticky (no flip-flopping).
+                        assert _PROBE_SLOPE_RING is not None
+                        if not _probe_ring_active:
+                            # Bookkeeping mode: P3 behaviour, ring is passive.
+                            preempted_req = max(
+                                self.running,
+                                key=_probe_g_slope,
+                            )
+                        else:
+                            # Active mode: ring-calibrated score with EMA pressure.
+                            preempted_req = max(
+                                self.running,
+                                key=lambda r: _PROBE_SLOPE_RING.query(  # type: ignore[union-attr]
+                                    r.num_computed_tokens,
+                                    _probe_g_slope(r),
+                                    memory_pressure=_probe_kv_ema,
+                                ),
+                            )
+                        _probe_slope_ring_pending[preempted_req.request_id] = (
+                            float(preempted_req.num_computed_tokens),
+                            _probe_g_slope(preempted_req),
+                            preempted_req.num_output_tokens,
+                        )
+                        self.running.remove(preempted_req)
+                        if preempted_req in scheduled_running_reqs:
+                            preempted_req_id = preempted_req.request_id
+                            scheduled_running_reqs.remove(preempted_req)
+                            token_budget += num_scheduled_tokens.pop(preempted_req_id)
+                            req_to_new_blocks.pop(preempted_req_id)
+                            scheduled_spec_decode_tokens.pop(preempted_req_id, None)
+                            preempted_encoder_inputs = scheduled_encoder_inputs.pop(
+                                preempted_req_id, None
+                            )
+                            if preempted_encoder_inputs:
+                                num_embeds_to_restore = sum(
+                                    preempted_req.get_num_encoder_embeds(i)
+                                    for i in preempted_encoder_inputs
+                                )
+                                encoder_compute_budget += num_embeds_to_restore
+                            req_index -= 1
+                    elif _PROBE_VICTIM == "shortest_first":
+                        # Baseline: InferMax (arXiv 2411.07447) — evict the
+                        # request with the smallest current KV cache to
+                        # minimise recompute cost on resumption.
+                        preempted_req = min(
+                            self.running,
+                            key=lambda r: r.num_computed_tokens,
+                        )
+                        self.running.remove(preempted_req)
+                        if preempted_req in scheduled_running_reqs:
+                            preempted_req_id = preempted_req.request_id
+                            scheduled_running_reqs.remove(preempted_req)
+                            token_budget += num_scheduled_tokens.pop(preempted_req_id)
+                            req_to_new_blocks.pop(preempted_req_id)
+                            scheduled_spec_decode_tokens.pop(preempted_req_id, None)
+                            preempted_encoder_inputs = scheduled_encoder_inputs.pop(
+                                preempted_req_id, None
+                            )
+                            if preempted_encoder_inputs:
+                                num_embeds_to_restore = sum(
+                                    preempted_req.get_num_encoder_embeds(i)
+                                    for i in preempted_encoder_inputs
+                                )
+                                encoder_compute_budget += num_embeds_to_restore
+                            req_index -= 1
+                    elif _PROBE_VICTIM == "random":
+                        # Control: uniform random victim, seeded RNG (see
+                        # _PROBE_VICTIM_SEED). Separates "any non-pathological
+                        # pick works" from genuine predictor value.
+                        preempted_req = _victim_rng.choice(self.running)
+                        self.running.remove(preempted_req)
+                        if preempted_req in scheduled_running_reqs:
+                            preempted_req_id = preempted_req.request_id
+                            scheduled_running_reqs.remove(preempted_req)
+                            token_budget += num_scheduled_tokens.pop(preempted_req_id)
+                            req_to_new_blocks.pop(preempted_req_id)
+                            scheduled_spec_decode_tokens.pop(preempted_req_id, None)
+                            preempted_encoder_inputs = scheduled_encoder_inputs.pop(
+                                preempted_req_id, None
+                            )
+                            if preempted_encoder_inputs:
+                                num_embeds_to_restore = sum(
+                                    preempted_req.get_num_encoder_embeds(i)
+                                    for i in preempted_encoder_inputs
+                                )
+                                encoder_compute_budget += num_embeds_to_restore
+                            req_index -= 1
+                    elif _PROBE_VICTIM == "sf_oracle_tiebreak":
+                        # SF primary (minimize recompute cost) with oracle
+                        # remaining-decode as a tie-breaker (prefer evicting
+                        # the cheap-victim with the longest tail).
+                        preempted_req = min(
+                            self.running,
+                            key=_sf_oracle_tiebreak_key,
+                        )
+                        self.running.remove(preempted_req)
+                        if preempted_req in scheduled_running_reqs:
+                            preempted_req_id = preempted_req.request_id
+                            scheduled_running_reqs.remove(preempted_req)
+                            token_budget += num_scheduled_tokens.pop(preempted_req_id)
+                            req_to_new_blocks.pop(preempted_req_id)
+                            scheduled_spec_decode_tokens.pop(preempted_req_id, None)
+                            preempted_encoder_inputs = scheduled_encoder_inputs.pop(
+                                preempted_req_id, None
+                            )
+                            if preempted_encoder_inputs:
+                                num_embeds_to_restore = sum(
+                                    preempted_req.get_num_encoder_embeds(i)
+                                    for i in preempted_encoder_inputs
+                                )
+                                encoder_compute_budget += num_embeds_to_restore
+                            req_index -= 1
+                    elif _PROBE_VICTIM == "input_length":
+                        # Baseline: FastServe (arXiv 2305.05920) — evict the
+                        # request with the longest input prompt, using prompt
+                        # length as a static proxy for total output length.
+                        preempted_req = max(
+                            self.running,
+                            key=lambda r: r.num_prompt_tokens,
+                        )
+                        self.running.remove(preempted_req)
+                        if preempted_req in scheduled_running_reqs:
+                            preempted_req_id = preempted_req.request_id
+                            scheduled_running_reqs.remove(preempted_req)
+                            token_budget += num_scheduled_tokens.pop(preempted_req_id)
+                            req_to_new_blocks.pop(preempted_req_id)
+                            scheduled_spec_decode_tokens.pop(preempted_req_id, None)
+                            preempted_encoder_inputs = scheduled_encoder_inputs.pop(
+                                preempted_req_id, None
+                            )
+                            if preempted_encoder_inputs:
+                                num_embeds_to_restore = sum(
+                                    preempted_req.get_num_encoder_embeds(i)
+                                    for i in preempted_encoder_inputs
+                                )
+                                encoder_compute_budget += num_embeds_to_restore
+                            req_index -= 1
+                    elif _PROBE_VICTIM == "least_decoded":
+                        # Baseline B2: least-decoded-first — evict the request
+                        # with the fewest generated tokens, isolating decode
+                        # progress from prompt length.
+                        preempted_req = min(
+                            self.running,
+                            key=lambda r: r.num_output_tokens,
+                        )
+                        self.running.remove(preempted_req)
+                        if preempted_req in scheduled_running_reqs:
+                            preempted_req_id = preempted_req.request_id
+                            scheduled_running_reqs.remove(preempted_req)
+                            token_budget += num_scheduled_tokens.pop(preempted_req_id)
+                            req_to_new_blocks.pop(preempted_req_id)
+                            scheduled_spec_decode_tokens.pop(preempted_req_id, None)
+                            preempted_encoder_inputs = scheduled_encoder_inputs.pop(
+                                preempted_req_id, None
+                            )
+                            if preempted_encoder_inputs:
+                                num_embeds_to_restore = sum(
+                                    preempted_req.get_num_encoder_embeds(i)
+                                    for i in preempted_encoder_inputs
+                                )
+                                encoder_compute_budget += num_embeds_to_restore
+                            req_index -= 1
+                    elif _PROBE_VICTIM == "largest_kv":
+                        # Baseline B3: largest-KV-first — evict the request
+                        # with the most computed tokens to free the maximum
+                        # KV-cache memory per preemption event.
+                        preempted_req = max(
+                            self.running,
+                            key=lambda r: r.num_computed_tokens,
+                        )
+                        self.running.remove(preempted_req)
+                        if preempted_req in scheduled_running_reqs:
+                            preempted_req_id = preempted_req.request_id
+                            scheduled_running_reqs.remove(preempted_req)
+                            token_budget += num_scheduled_tokens.pop(preempted_req_id)
+                            req_to_new_blocks.pop(preempted_req_id)
+                            scheduled_spec_decode_tokens.pop(preempted_req_id, None)
+                            preempted_encoder_inputs = scheduled_encoder_inputs.pop(
+                                preempted_req_id, None
+                            )
+                            if preempted_encoder_inputs:
+                                num_embeds_to_restore = sum(
+                                    preempted_req.get_num_encoder_embeds(i)
+                                    for i in preempted_encoder_inputs
+                                )
+                                encoder_compute_budget += num_embeds_to_restore
+                            req_index -= 1
+                    elif _PROBE_VICTIM == "benefit_cost":
+                        # Baseline B5: DBMS-inspired benefit/cost ratio.
+                        # benefit = KV blocks freed ∝ num_computed_tokens
+                        # cost    = recompute cost  ∝ num_prompt_tokens
+                        # Evict the request that maximises KV freed per unit
+                        # of recompute cost; avoids the degenerate case where
+                        # benefit and cost are both proportional to KV size.
+                        preempted_req = max(
+                            self.running,
+                            key=lambda r: r.num_computed_tokens / max(r.num_prompt_tokens, 1),
+                        )
+                        self.running.remove(preempted_req)
+                        if preempted_req in scheduled_running_reqs:
+                            preempted_req_id = preempted_req.request_id
+                            scheduled_running_reqs.remove(preempted_req)
+                            token_budget += num_scheduled_tokens.pop(preempted_req_id)
+                            req_to_new_blocks.pop(preempted_req_id)
+                            scheduled_spec_decode_tokens.pop(preempted_req_id, None)
+                            preempted_encoder_inputs = scheduled_encoder_inputs.pop(
+                                preempted_req_id, None
+                            )
+                            if preempted_encoder_inputs:
+                                num_embeds_to_restore = sum(
+                                    preempted_req.get_num_encoder_embeds(i)
+                                    for i in preempted_encoder_inputs
+                                )
+                                encoder_compute_budget += num_embeds_to_restore
+                            req_index -= 1
                     else:
-                        preempted_req = self.running.pop()
+                        # Default FCFS: evict most recently admitted request.
+                        # When PROBE_DEFAULT_LIFO_SHIELD=1 (default_ab recipe),
+                        # preserve LIFO order but skip shielded requests.
+                        if _PROBE_DEFAULT_LIFO_SHIELD:
+                            eligible_set = set(id(r) for r in _eligible_for_preempt(self.running))
+                            preempted_req = None
+                            for r in reversed(self.running):
+                                if id(r) in eligible_set:
+                                    preempted_req = r
+                                    break
+                            if preempted_req is None:
+                                preempted_req = self.running.pop()
+                            else:
+                                self.running.remove(preempted_req)
+                        else:
+                            preempted_req = self.running.pop()
+
+                    # PROBE M2: log this preemption event.
+                    _ppl.log_preemption(
+                        req_id=preempted_req.request_id,
+                        num_computed=preempted_req.num_computed_tokens,
+                        num_preemptions_after=preempted_req.num_preemptions + 1,
+                        cascade_pos=len(preempted_reqs),
+                        timestamp=scheduled_timestamp,
+                    )
 
                     self._preempt_request(preempted_req, scheduled_timestamp)
                     preempted_reqs.append(preempted_req)
@@ -560,11 +2165,92 @@ class Scheduler(SchedulerInterface):
             )
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
+        # PROBE M2: advance cascade counter once per schedule() call.
+        if preempted_reqs:
+            _ppl.advance_cascade()
+
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
+            # PROBE: oracle admission gate. If the in-flight pool's projected
+            # remaining KV demand already exceeds free capacity, refuse to
+            # admit anything this step — let existing requests drain first.
+            # This prevents the recompute-thrash that pure preemption can't.
+            if _PROBE_ADMISSION == "oracle":
+                admission_blocked = _oracle_admission_overcommit(
+                    self.running,
+                    self.kv_cache_manager.block_pool,
+                    self.block_size,
+                )
+            elif _PROBE_ADMISSION == "oracle_co":
+                admission_blocked = _oracle_co_admission_should_refuse(
+                    self.running,
+                    self.kv_cache_manager.block_pool,
+                    self.block_size,
+                )
+            elif _PROBE_ADMISSION == "oracle_co_sf":
+                admission_blocked = _oracle_co_sf_admission_should_refuse(
+                    self.running,
+                    self.kv_cache_manager.block_pool,
+                    self.block_size,
+                )
+            elif _PROBE_ADMISSION == "entropy_co_sf":
+                admission_blocked = _entropy_co_sf_admission_should_refuse(
+                    self.running,
+                    self.kv_cache_manager.block_pool,
+                    self.block_size,
+                )
+            elif _PROBE_ADMISSION == "entropy_co":
+                admission_blocked = _entropy_co_admission_should_refuse(
+                    self.running,
+                    self.kv_cache_manager.block_pool,
+                    self.block_size,
+                )
+            elif _PROBE_ADMISSION == "oracle_co_lifo":
+                admission_blocked = _oracle_co_lifo_admission_should_refuse(
+                    self.running,
+                    self.kv_cache_manager.block_pool,
+                    self.block_size,
+                )
+            elif _PROBE_ADMISSION == "oracle_co_il":
+                admission_blocked = _oracle_co_il_admission_should_refuse(
+                    self.running,
+                    self.kv_cache_manager.block_pool,
+                    self.block_size,
+                )
+            elif _PROBE_ADMISSION == "oracle_co_lr":
+                admission_blocked = _oracle_co_lr_admission_should_refuse(
+                    self.running,
+                    self.kv_cache_manager.block_pool,
+                    self.block_size,
+                )
+            elif _PROBE_ADMISSION == "oracle_co_adapt":
+                admission_blocked = _oracle_co_adapt_admission_should_refuse(
+                    self.running,
+                    self.kv_cache_manager.block_pool,
+                    self.block_size,
+                )
+            elif _PROBE_ADMISSION == "oracle_co_pred":
+                admission_blocked = _oracle_pred_admission_should_refuse(
+                    self.running,
+                    self.kv_cache_manager.block_pool,
+                    self.block_size,
+                )
+            elif _PROBE_ADMISSION == "oracle_reservation":
+                admission_blocked = _oracle_reservation_admission_should_refuse(
+                    self.running,
+                    self.kv_cache_manager.block_pool,
+                    self.block_size,
+                )
+            else:
+                admission_blocked = False
+
             step_skipped_waiting = create_request_queue(self.policy)
 
-            while (self.waiting or self.skipped_waiting) and token_budget > 0:
+            while (
+                not admission_blocked
+                and (self.waiting or self.skipped_waiting)
+                and token_budget > 0
+            ):
                 if len(self.running) == self.max_num_running_reqs:
                     break
 
@@ -598,6 +2284,14 @@ class Scheduler(SchedulerInterface):
                     )
                 ):
                     # Scheduling would exceed max_loras, skip.
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
+
+                # PROBE Method 5 — two-level admission: defer long arrivals
+                # if long-lane is at capacity. Shorts always admit.
+                if (_PROBE_ADMISSION == "oracle_two_level"
+                        and _two_level_should_skip_arrival(request, self.running)):
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
@@ -810,6 +2504,18 @@ class Scheduler(SchedulerInterface):
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
                     )
+                # PROBE lifecycle: log first-admit and resume-after-preempt
+                # events. Combined with preempt.jsonl (when each request leaves
+                # running) this gives full request lifecycle for bottleneck
+                # analysis (queue wait + active session durations).
+                _is_resume = request.status == RequestStatus.PREEMPTED
+                _ppl.log_admit(
+                    req_id=request.request_id,
+                    prompt_tokens=len(request.prompt_token_ids),
+                    timestamp=scheduled_timestamp,
+                    is_resume=_is_resume,
+                    num_computed_at_admit=request.num_computed_tokens,
+                )
                 if request.status == RequestStatus.WAITING:
                     scheduled_new_reqs.append(request)
                 elif request.status == RequestStatus.PREEMPTED:
@@ -911,6 +2617,21 @@ class Scheduler(SchedulerInterface):
             else None
         )
 
+        # Split preempted_reqs into reactive-offload (PRE_OFFLOADING) and
+        # immediate-free (PREEMPTED). The offload connector consumes the
+        # former via _get_proactive_store_specs; the latter resets block_ids
+        # in _get_reqs_to_store.
+        if self._step_proactive_preempts:
+            preempted_immediate_ids = {
+                req.request_id for req in preempted_reqs
+                if req.request_id not in self._step_proactive_preempts
+            }
+            proactive_ids = set(self._step_proactive_preempts)
+            self._step_proactive_preempts.clear()
+        else:
+            preempted_immediate_ids = {req.request_id for req in preempted_reqs}
+            proactive_ids = None
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -919,7 +2640,8 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             num_common_prefix_blocks=num_common_prefix_blocks,
-            preempted_req_ids={req.request_id for req in preempted_reqs},
+            preempted_req_ids=preempted_immediate_ids,
+            proactive_preempted_req_ids=proactive_ids,
             # finished_req_ids is an existing state in the scheduler,
             # instead of being newly scheduled in this step.
             # It contains the request IDs that are finished in between
@@ -958,14 +2680,73 @@ class Scheduler(SchedulerInterface):
 
         NOTE: The request should be popped from the running queue outside of this
         method.
+
+        Two modes:
+          (a) Default (DISCARD-style): immediately free GPU blocks; request must
+              re-prefill from scratch on resume.
+          (b) PROBE_REACTIVE_OFFLOAD=1 with offload connector attached: route
+              through the PRE_OFFLOADING state.  Blocks move to a draining
+              pool; the connector schedules async D2H of remaining KV; on
+              completion, _finalize_proactive_preemption releases the drain
+              pool and moves the request to PREEMPTED in the waiting queue.
+              On resume, the offload manager's prefix-cache lookup finds the
+              CPU copy → cheap restore instead of full re-prefill.
+              Trigger condition and event count are identical to (a).
         """
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
+
+        # Reactive-offload gating:
+        # - free_to_drain moves blocks to a DRAIN POOL, not the free pool.
+        #   They become available again only after async D2H completes
+        #   (at earliest, next scheduler step).
+        # - If we use reactive-offload during an admission cascade, the
+        #   freed-but-draining blocks don't satisfy allocate_slots, so
+        #   the loop cascades into preempting more victims → drain pool
+        #   inflates, preempt count balloons.
+        # - Fix: at most ONE reactive-offload preempt per scheduler step.
+        #   Subsequent preempts in the same step fall back to immediate-
+        #   discard so admission completes. Across steps, the drain pool
+        #   clears (async D2H finishes) before the next reactive-offload
+        #   fires. This caps drain-pool growth at 1 per step while still
+        #   providing cheap resume for the most-recently-preempted req.
+        if (
+            _PROBE_REACTIVE_OFFLOAD
+            and self.connector is not None
+            and not self._step_proactive_preempts
+        ):
+            # Mode (b): reactive offload (first preempt of this step).
+            drain_ids = self.kv_cache_manager.free_to_drain(request)
+            self._probe_drain_block_ids[request.request_id] = drain_ids
+            self._probe_pre_offloading[request.request_id] = request
+            self.encoder_cache_manager.free(request)
+            request.status = RequestStatus.PRE_OFFLOADING
+            if request.spec_token_ids:
+                request.spec_token_ids = []
+            request.num_preemptions += 1
+            if self.log_stats:
+                request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
+            # Tell the connector to store this request's remaining blocks now
+            # (consumed in scheduler_output.proactive_preempted_req_ids).
+            self._step_proactive_preempts.add(request.request_id)
+            # The request is NOT requeued to waiting yet — that happens in
+            # _finalize_proactive_preemption once async D2H completes.
+            return
+
+        # Mode (a): existing DISCARD-style immediate-free path.
         self.kv_cache_manager.free(request)
         self.encoder_cache_manager.free(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
+        request.probe_ema_h = _PROBE_RESET_H   # PROBE M3: reset on requeue; P3b warms to H_max
+        request.probe_ema_h_fast = _PROBE_RESET_H
+        request.probe_ema_p_eos = 0.0          # PROBE A1: reset P(EOS) EMA
+        request.probe_ema_p_eos_fast = 0.0
+        request.probe_peak_h = 0.0             # PROBE P3g: reset peak entropy
+        request.probe_spike_ema = 0.0          # probe_spike: reset spike-rate EMA
+        request.probe_spike_count = 0          # S2: reset cumulative spike count
+        request.probe_near_zero_count = 0      # 2-feature predictor: reset near-zero count
         if request.spec_token_ids:
             request.spec_token_ids = []
         request.num_preemptions += 1
@@ -974,6 +2755,42 @@ class Scheduler(SchedulerInterface):
 
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
+
+    def _finalize_proactive_preemption(
+        self,
+        request: Request,
+        scheduled_timestamp: float | None,
+    ) -> None:
+        """Called when async D2H for a PRE_OFFLOADING request completes.
+
+        GPU blocks were freed to the draining pool at pre-offload start.
+        Now that D2H is confirmed done, release them to the free queue so
+        new requests can use them.  Move the request to waiting as PREEMPTED.
+        The CPU copy is available via the offloading connector for H2D on resume.
+        """
+        assert request.status == RequestStatus.PRE_OFFLOADING
+        drain_ids = self._probe_drain_block_ids.pop(request.request_id, [])
+        self.kv_cache_manager.release_draining(drain_ids)
+        self.encoder_cache_manager.free(request)
+        request.status = RequestStatus.PREEMPTED
+        request.num_computed_tokens = 0
+        request.probe_ema_h = 0.0
+        request.probe_ema_h_fast = 0.0
+        request.probe_ema_p_eos = 0.0
+        request.probe_ema_p_eos_fast = 0.0
+        if request.spec_token_ids:
+            request.spec_token_ids = []
+        # num_preemptions was already incremented in _preempt_request at
+        # trigger time; do NOT double-count here.
+        if self.log_stats and scheduled_timestamp is not None:
+            request.record_event(EngineCoreEventType.PREEMPTED, scheduled_timestamp)
+        self._probe_pre_offloading.pop(request.request_id, None)
+        self.waiting.prepend_request(request)
+        logger.debug(
+            "PROBE proactive pre-offload complete: req %s freed GPU blocks "
+            "and moved to waiting (H2D on resume from CPU copy)",
+            request.request_id,
+        )
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER
@@ -1359,6 +3176,50 @@ class Scheduler(SchedulerInterface):
                 continue
 
             req_index = model_runner_output.req_id_to_index[req_id]
+
+            # PROBE M3: update per-request EMA entropy for g_rough / g_slope.
+            if (model_runner_output.token_entropy is not None
+                    and req_index < len(model_runner_output.token_entropy)):
+                h_t = model_runner_output.token_entropy[req_index]
+                request.probe_ema_h = (
+                    _PROBE_EMA_ALPHA * h_t
+                    + (1.0 - _PROBE_EMA_ALPHA) * request.probe_ema_h
+                )
+                request.probe_ema_h_fast = (
+                    _PROBE_EMA_ALPHA_FAST * h_t
+                    + (1.0 - _PROBE_EMA_ALPHA_FAST) * request.probe_ema_h_fast
+                )
+                # P3g: track running maximum entropy for peak-gap discount.
+                if h_t > request.probe_peak_h:
+                    request.probe_peak_h = h_t
+                # probe_spike: EMA of spike indicator.
+                spike = 1.0 if h_t > _PROBE_SPIKE_THRESHOLD else 0.0
+                request.probe_spike_ema = (
+                    _PROBE_SPIKE_ALPHA * spike
+                    + (1.0 - _PROBE_SPIKE_ALPHA) * request.probe_spike_ema
+                )
+                # S2 online length predictor: cumulative spike count.
+                # rate = spike_count / num_computed is the feature for T̂.
+                if spike:
+                    request.probe_spike_count += 1
+                # 2-feature predictor: cumulative near-zero (high-confidence) count.
+                # zero_rate = near_zero_count / num_computed pairs with spike rate.
+                if h_t < _PROBE_ZERO_THRESHOLD:
+                    request.probe_near_zero_count += 1
+
+            # PROBE A1: update per-request EMA P(EOS) for probe_slope_peos.
+            if (model_runner_output.token_p_eos is not None
+                    and req_index < len(model_runner_output.token_p_eos)):
+                p_t = model_runner_output.token_p_eos[req_index]
+                request.probe_ema_p_eos = (
+                    _PROBE_EMA_ALPHA * p_t
+                    + (1.0 - _PROBE_EMA_ALPHA) * request.probe_ema_p_eos
+                )
+                request.probe_ema_p_eos_fast = (
+                    _PROBE_EMA_ALPHA_FAST * p_t
+                    + (1.0 - _PROBE_EMA_ALPHA_FAST) * request.probe_ema_p_eos_fast
+                )
+
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
@@ -1417,6 +3278,22 @@ class Scheduler(SchedulerInterface):
                 finished = self._handle_stopped_request(request)
                 if finished:
                     kv_transfer_params = self._free_request(request)
+                    # PROBE lifecycle: completion event.
+                    _ppl.log_complete(
+                        req_id=request.request_id,
+                        num_output_tokens=request.num_output_tokens,
+                        timestamp=time.monotonic(),
+                        finish_reason=str(finish_reason) if finish_reason else "unknown",
+                    )
+
+                    # PROBE M4: update growth ring with observed actual remaining.
+                    # We stored a snapshot when this request was last preempted;
+                    # now that it has finished we know how many tokens it actually
+                    # generated after that checkpoint.
+                    if _PROBE_SLOPE_RING is not None and req_id in _probe_slope_ring_pending:
+                        snap_len, snap_g, snap_out = _probe_slope_ring_pending.pop(req_id)
+                        actual_remaining = request.num_output_tokens - snap_out
+                        _PROBE_SLOPE_RING.update(snap_len, snap_g, float(actual_remaining))
 
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
@@ -1788,6 +3665,15 @@ class Scheduler(SchedulerInterface):
             valid_requests.append(request)
             if request.status == RequestStatus.RUNNING:
                 running_requests_to_remove.add(request)
+            elif request.status == RequestStatus.PRE_OFFLOADING:
+                # Blocks are in the draining pool; release them now.
+                # The request is NOT in self.running (was removed at pre-offload
+                # trigger), so no running-queue removal is needed.  _free_request
+                # will call kv_cache_manager.free() which is a no-op since
+                # req_to_blocks was already cleared by free_to_drain().
+                drain_ids = self._probe_drain_block_ids.pop(req_id, [])
+                self.kv_cache_manager.release_draining(drain_ids)
+                self._probe_pre_offloading.pop(req_id, None)
             else:
                 if request.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
                     self.num_waiting_for_streaming_input -= 1
@@ -2134,8 +4020,19 @@ class Scheduler(SchedulerInterface):
                 self._free_blocks(self.requests[req_id])
         for req_id in kv_connector_output.finished_sending or ():
             logger.debug("Finished sending KV transfer for request %s", req_id)
-            assert req_id in self.requests
-            self._free_blocks(self.requests[req_id])
+            if req_id not in self.requests:
+                # Request completed or was aborted before the D2H transfer
+                # callback fired; blocks already freed at completion time.
+                logger.debug("Skipping finished_sending for already-removed "
+                             "request %s", req_id)
+                continue
+            req = self.requests[req_id]
+            if req.status == RequestStatus.PRE_OFFLOADING:
+                # Proactive D2H complete: GPU blocks are still valid (we held
+                # them until now), so free them safely, then move to waiting.
+                self._finalize_proactive_preemption(req, scheduled_timestamp=None)
+            else:
+                self._free_blocks(req)
 
     def _update_requests_with_invalid_blocks(
         self,

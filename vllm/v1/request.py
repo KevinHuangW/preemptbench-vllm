@@ -159,6 +159,38 @@ class Request:
         # The number of times this request has been preempted by the scheduler.
         self.num_preemptions = 0
 
+        # PROBE M3: EMA-smoothed Shannon entropy for remaining-growth estimation.
+        # Reset to 0.0 on preemption (request restarts from prompt).
+        # probe_ema_h      — slow EMA (α=0.1): stable long-run entropy level.
+        # probe_ema_h_fast — fast EMA (α=0.3): tracks recent entropy; used by
+        #   probe_slope to detect phase transitions (entropy cliff) quickly and
+        #   to penalise sequences whose entropy is actively rising.
+        # P3b warm-init: initialise EMAs to H_max so new sequences are treated
+        # as maximally uncertain rather than converging (fixes cold-start transient).
+        import os as _probe_os
+        _probe_h_init: float = (
+            11.762 if _probe_os.environ.get("PROBE_VICTIM") in ("probe_slope_b",) else 0.0
+        )
+        self.probe_ema_h: float = _probe_h_init
+        self.probe_ema_h_fast: float = _probe_h_init
+        # probe_slope_peos ablation: EMA of P(EOS) instead of entropy.
+        self.probe_ema_p_eos: float = 0.0       # slow EMA (α=0.1)
+        self.probe_ema_p_eos_fast: float = 0.0  # fast EMA (α=0.3)
+        # P3g: running maximum of observed entropy (tracks peak before convergence).
+        self.probe_peak_h: float = 0.0
+        # probe_spike: EMA of spike indicator (H_t > threshold). α=0.05 gives
+        # ~20-token recency window; captures active decision-making rate.
+        self.probe_spike_ema: float = 0.0
+        # probe_spike_count: cumulative count of high-entropy tokens. Used by
+        # the S2 entropy-based decode-length predictor (an online stand-in for
+        # the offline oracle): T̂ = exp(a + b · spike_count / num_computed).
+        self.probe_spike_count: int = 0
+        # probe_near_zero_count: cumulative count of low-entropy (high-confidence)
+        # tokens. Pairs with probe_spike_count in the 2-feature spike+zero
+        # predictor that generalizes across reasoning corpora (AIME's spike-only
+        # signal degenerates on open-domain HLE; spike+zero recovers it).
+        self.probe_near_zero_count: int = 0
+
         # The number of tokens that have been computed remotely.
         self.num_external_computed_tokens = 0
 
@@ -300,6 +332,10 @@ class RequestStatus(enum.IntEnum):
     WAITING_FOR_REMOTE_KVS = enum.auto()
     WAITING_FOR_STREAMING_REQ = enum.auto()
     RUNNING = enum.auto()
+    # Request removed from running queue; GPU blocks still held while async
+    # D2H pre-offload completes.  Transitions to PREEMPTED once the worker
+    # signals finished_sending for this request.
+    PRE_OFFLOADING = enum.auto()
     PREEMPTED = enum.auto()
     # Note: anything after PREEMPTED will be considered
     # as a finished status.

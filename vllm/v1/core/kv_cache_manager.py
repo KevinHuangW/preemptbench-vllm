@@ -436,6 +436,18 @@ class KVCacheManager:
         """
         self.coordinator.free(request.request_id)
 
+    def free_to_drain(self, request: "Request") -> list[int]:
+        """Free request blocks to the draining pool for async D2H.
+
+        Returns the list of draining block IDs.  Call release_draining() once
+        async D2H completes to make the blocks available for reuse.
+        """
+        return self.coordinator.free_to_drain(request.request_id)
+
+    def release_draining(self, block_ids: list[int]) -> None:
+        """Move draining blocks to the free queue (D2H complete)."""
+        self.block_pool.release_draining_blocks(block_ids)
+
     def remove_skipped_blocks(
         self, request_id: str, total_computed_tokens: int
     ) -> None:

@@ -92,6 +92,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
     funaudiochat="FunAudioChatConfig",
     hunyuan_vl="HunYuanVLConfig",
     isaac="IsaacConfig",
+    glm_moe_dsa="DeepseekV3Config",  # GLM-5.1 uses DeepSeek V2 MLA backend
     kimi_k2="DeepseekV3Config",  # Kimi K2 uses same architecture as DeepSeek V3
     kimi_linear="KimiLinearConfig",
     kimi_vl="KimiVLConfig",

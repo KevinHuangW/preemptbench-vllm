@@ -216,6 +216,12 @@ class SchedulerOutput:
     # Only used for v2 model runner.
     preempted_req_ids: set[str] | None = None
 
+    # Request IDs proactively moved to PRE_OFFLOADING this step (PROBE only).
+    # These requests are no longer in the running queue but still hold GPU
+    # blocks; the offloading connector should start async D2H for them and
+    # signal via finished_sending when complete.
+    proactive_preempted_req_ids: set[str] | None = None
+
     # Whether any of the scheduled requests use structured output.
     # Set only in async scheduling case.
     has_structured_output_requests: bool = False

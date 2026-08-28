@@ -20,6 +20,7 @@ import msgspec
 import zmq
 
 import vllm.envs as envs
+from vllm.v1 import probe_logger as _probe_logger
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
 from vllm.envs import enable_envs_cache
@@ -301,6 +302,8 @@ class EngineCore:
             raise TypeError(
                 f"request_id must be a string, got {type(request.request_id)}"
             )
+        # PROBE: log prompt-prefix/suffix ids for offline oracle lookup build.
+        _probe_logger.log_prompt(request)
 
         if pooling_params := request.pooling_params:
             supported_pooling_tasks = [
@@ -402,6 +405,8 @@ class EngineCore:
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
+        # PROBE: log per-step entropy before scheduler removes finished reqs
+        _probe_logger.log_step(model_output)
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
@@ -506,6 +511,8 @@ class EngineCore:
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
+        # PROBE: log per-step entropy (same hook as step())
+        _probe_logger.log_step(model_output)
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )

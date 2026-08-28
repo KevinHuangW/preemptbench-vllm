@@ -123,6 +123,10 @@ class SamplerOutput:
     # PLACEHOLDER_TOKEN_ID (-1 by default) is used for padding.
     sampled_token_ids: torch.Tensor
     logprobs_tensors: LogprobsTensors | None
+    # PROBE: per-request Shannon entropy (nats) from pre-penalty logits [num_reqs]
+    token_entropy: torch.Tensor | None = None
+    # PROBE: per-request P(EOS) from pre-penalty logits [num_reqs]
+    token_p_eos: torch.Tensor | None = None
 
 
 T = TypeVar("T")
@@ -252,6 +256,11 @@ class ModelRunnerOutput:
 
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
+
+    # PROBE: per-request entropy (nats) for this decode step; one float per req
+    token_entropy: list[float] | None = None
+    # PROBE: per-request P(EOS) for this decode step; one float per req
+    token_p_eos: list[float] | None = None
 
 
 # ModelRunnerOutput wrapper for async scheduling.

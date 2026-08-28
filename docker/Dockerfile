@@ -107,6 +107,7 @@ RUN apt-get update -y \
         sudo \
         python3-pip \
         libibverbs-dev \
+        ninja-build \
         # Upgrade to GCC 10 to avoid https://gcc.gnu.org/bugzilla/show_bug.cgi?id=92519
         # as it was causing spam when compiling the CUTLASS kernels
         gcc-10 \

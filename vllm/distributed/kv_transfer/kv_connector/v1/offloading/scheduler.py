@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 from collections import defaultdict
 from collections.abc import Iterable
 from itertools import islice
 from typing import Any
+
+from vllm.v1 import probe_preempt_logger as _ppl
 
 from vllm.distributed.kv_events import BlockRemoved, BlockStored, KVCacheEvent
 from vllm.distributed.kv_transfer.kv_connector.utils import yield_req_data
@@ -257,6 +260,13 @@ class OffloadingConnectorScheduler:
             reqs_to_store[req_id] = (src_spec, dst_spec)
             self._reqs_being_stored[req_id] |= block_hashes_to_store
 
+            _ppl.log_offload(
+                req_id,
+                len(store_output.block_hashes_to_store),
+                len(store_output.block_hashes_evicted),
+                time.time(),
+            )
+
             logger.debug(
                 "Request %s offloading %s blocks starting from block #%d",
                 req_id,
@@ -266,13 +276,103 @@ class OffloadingConnectorScheduler:
 
         return reqs_to_store
 
+    def _get_proactive_store_specs(
+        self, proactive_req_ids: set[str]
+    ) -> dict[ReqId, TransferSpec]:
+        """Build store TransferSpecs for requests being proactively pre-offloaded.
+
+        These requests are no longer in the running queue but still hold GPU
+        blocks.  We store all blocks from _next_stored_block_idx onward.
+        """
+        reqs_to_proactive_store: dict[ReqId, TransferSpec] = {}
+        for req_id in proactive_req_ids:
+            req = self._requests.get(req_id)
+            block_ids = self._request_block_ids.get(req_id)
+            if req is None or block_ids is None:
+                continue
+
+            # Determine the range of offload-sized blocks to store now.
+            # num_computed_tokens is still valid (not yet reset for PRE_OFFLOADING).
+            num_blocks = req.num_computed_tokens // self.offloaded_block_size
+            start_block_idx = self._next_stored_block_idx.get(req_id, 0)
+            num_new_blocks = num_blocks - start_block_idx
+            if num_new_blocks <= 0:
+                continue
+
+            num_gpu_blocks = num_blocks * self.block_size_factor
+            if len(req.block_hashes) < num_gpu_blocks:
+                continue
+
+            new_block_hashes = self._get_block_hashes(
+                req, start_idx=start_block_idx, end_idx=num_blocks
+            )
+            store_output = self.manager.prepare_store(new_block_hashes)
+            if store_output is None:
+                logger.warning(
+                    "Proactive offload request %s: cannot store %s blocks",
+                    req_id,
+                    num_new_blocks,
+                )
+                continue
+
+            self._next_stored_block_idx[req_id] = num_blocks
+
+            if not store_output.block_hashes_to_store:
+                continue
+            block_hashes_to_store = set(store_output.block_hashes_to_store)
+
+            all_block_hashes = self._get_block_hashes(req, end_idx=num_blocks)
+            self.manager.touch(all_block_hashes)
+
+            new_block_hashes = self._get_block_hashes(
+                req, start_idx=start_block_idx, end_idx=num_blocks
+            )
+            dst_spec = store_output.store_spec
+            src_block_ids: list[int] = []
+            for idx, blk_hash in enumerate(new_block_hashes):
+                if blk_hash not in block_hashes_to_store:
+                    continue
+                offloaded_block_idx = start_block_idx + idx
+                gpu_block_idx = offloaded_block_idx * self.block_size_factor
+                for i in range(self.block_size_factor):
+                    src_block_ids.append(block_ids[gpu_block_idx + i])
+            src_spec = GPULoadStoreSpec(
+                src_block_ids, group_sizes=(len(src_block_ids),)
+            )
+
+            reqs_to_proactive_store[req_id] = (src_spec, dst_spec)
+            self._reqs_being_stored[req_id] |= block_hashes_to_store
+
+            _ppl.log_offload(
+                req_id,
+                len(store_output.block_hashes_to_store),
+                len(store_output.block_hashes_evicted),
+                time.time(),
+            )
+
+            logger.debug(
+                "Proactive offload: request %s pre-offloading %s blocks from #%d",
+                req_id,
+                len(block_hashes_to_store),
+                start_block_idx,
+            )
+
+        return reqs_to_proactive_store
+
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
+        reqs_to_proactive_store: dict[ReqId, TransferSpec] | None = None
+        if scheduler_output.proactive_preempted_req_ids:
+            reqs_to_proactive_store = self._get_proactive_store_specs(
+                scheduler_output.proactive_preempted_req_ids
+            )
+
         meta = OffloadingConnectorMetadata(
             reqs_to_load=self._reqs_to_load,
             reqs_to_store=self._get_reqs_to_store(scheduler_output),
             reqs_to_flush=scheduler_output.preempted_req_ids,
+            reqs_to_proactive_store=reqs_to_proactive_store,
         )
         self._reqs_to_load = {}
 

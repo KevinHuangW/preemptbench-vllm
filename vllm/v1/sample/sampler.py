@@ -2,8 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A layer that samples the next tokens from the model's outputs."""
 
+import os
+
 import torch
 import torch.nn as nn
+
+# PROBE: EOS token ID for P(EOS) ablation (DeepSeek-R1 default: 1).
+_PROBE_EOS_TOKEN_ID: int = int(os.environ.get("PROBE_EOS_TOKEN_ID", "1"))
 
 from vllm.config.model import LogprobsMode
 from vllm.utils.platform_utils import is_pin_memory_available
@@ -89,6 +94,14 @@ class Sampler(nn.Module):
         # Use float32 for the logits.
         logits = logits.to(torch.float32)
 
+        # PROBE: compute per-token Shannon entropy (nats) from the unpenalized
+        # logit distribution.  This is a zero-cost side-effect: logits are
+        # already on GPU and float32 at this point.
+        with torch.no_grad():
+            _log_p = logits.log_softmax(dim=-1)
+            token_entropy: torch.Tensor | None = -(_log_p.exp() * _log_p).sum(dim=-1)
+            token_p_eos: torch.Tensor | None = _log_p[:, _PROBE_EOS_TOKEN_ID].exp()
+
         logits = self.apply_logits_processors(
             logits, sampling_metadata, predict_bonus_token
         )
@@ -125,6 +138,8 @@ class Sampler(nn.Module):
             # token per request.
             sampled_token_ids=sampled.unsqueeze(-1),
             logprobs_tensors=logprobs_tensors,
+            token_entropy=token_entropy,
+            token_p_eos=token_p_eos,
         )
         return sampler_output
 

@@ -290,6 +290,18 @@ class SingleTypeKVCacheManager(ABC):
         self.block_pool.free_blocks(ordered_blocks)
         self.num_cached_block.pop(request_id, None)
 
+    def free_to_drain(self, request_id: str) -> list[int]:
+        """Logically free the request's blocks to the draining pool.
+
+        Blocks are removed from the request mapping and their ref_cnt is
+        decremented, but they are held off the free queue until
+        release_draining_blocks() is called (i.e. async D2H completes).
+        Returns the list of draining block IDs.
+        """
+        req_blocks = self.req_to_blocks.pop(request_id, [])
+        self.num_cached_block.pop(request_id, None)
+        return self.block_pool.free_blocks_to_drain(reversed(req_blocks))
+
     @abstractmethod
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         """
