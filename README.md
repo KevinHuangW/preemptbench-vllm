@@ -1,4 +1,62 @@
 <!-- markdownlint-disable MD001 MD041 -->
+
+# PreemptBench evaluated engine snapshot
+
+This repository is the clean engine release for the PreemptBench paper, based on
+upstream vLLM `v0.19.0` commit
+`2a69949bdadf0e8942b7a1619b229cb475beef20`. The sanitized public snapshot is
+source-equivalent to the retained implementation's runtime trees:
+
+```text
+vllm/   ff66acc11d7f0f0a0eb23a543885a53244a7eea0
+docker/ 9abe40dc1609ea40129c1528da2bcc8864356a1c
+```
+
+The companion benchmark harness is
+[`KevinHuangW/preemptbench`](https://github.com/KevinHuangW/preemptbench).
+
+Historical traces did not record a Git SHA, and some runs predate creation of
+the retained internal capture commit. The capture therefore documents the
+implementation retained after data collection; it is not cryptographic proof
+of the exact checkout used by every run.
+
+The headline experiments used these runtime settings:
+
+```text
+PROBE_REACTIVE_OFFLOAD=0
+PROBE_SHIELD_NEAR_COMPLETE_K=0
+PROBE_MAX_PREEMPTS_PER_REQ=4
+PROBE_DEFAULT_LIFO_SHIELD=0
+```
+
+The seven evaluated selectors map to the engine as follows:
+
+| Paper name | Harness key | `PROBE_VICTIM` |
+| --- | --- | --- |
+| `LIFO` | `default` | `default` |
+| `smallest_kv` | `shortest_first` | `shortest_first` |
+| `input_length` | `input_length` | `input_length` |
+| `largest_kv` | `largest_kv` | `largest_kv` |
+| `entropy` | `entropy_remaining` | `entropy_remaining` |
+| empirical statistical length oracle | `oracle_remaining` | `oracle` |
+| `random` | `random` | `random` |
+
+Other experimental selector branches visible in the captured source,
+including `least_decoded`, were not among the seven evaluated PreemptBench
+selectors. This repository contains no model weights, benchmark prompts, or
+execution traces. See [PREEMPTBENCH_CHANGES.md](PREEMPTBENCH_CHANGES.md) for
+the modification notice and
+[PREEMPTBENCH_PROVENANCE.json](PREEMPTBENCH_PROVENANCE.json) for the
+machine-readable release contract.
+
+Run the dependency-free release-contract test with:
+
+```bash
+python3 -m unittest release_tests.test_release_contract
+```
+
+The remainder of this README is the upstream vLLM `v0.19.0` documentation.
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">

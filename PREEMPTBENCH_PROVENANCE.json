@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "repository": "preemptbench-vllm",
+  "public_url": "https://github.com/KevinHuangW/preemptbench-vllm",
+  "companion_harness_url": "https://github.com/KevinHuangW/preemptbench",
+  "release_tag": "preemptbench-evaluated-v1.0.0",
+  "upstream": {
+    "url": "https://github.com/vllm-project/vllm",
+    "commit": "2a69949bdadf0e8942b7a1619b229cb475beef20",
+    "version": "v0.19.0"
+  },
+  "retained_internal_capture": "799a0dc383b43791ed820c421ee3292d810b9635",
+  "runtime_trees": {
+    "vllm": "ff66acc11d7f0f0a0eb23a543885a53244a7eea0",
+    "docker": "9abe40dc1609ea40129c1528da2bcc8864356a1c"
+  },
+  "trace_metadata_records_git_commit": false,
+  "headline_runtime_settings": {
+    "PROBE_REACTIVE_OFFLOAD": "0",
+    "PROBE_SHIELD_NEAR_COMPLETE_K": "0",
+    "PROBE_MAX_PREEMPTS_PER_REQ": "4",
+    "PROBE_DEFAULT_LIFO_SHIELD": "0"
+  },
+  "evaluated_policy_map": [
+    {
+      "paper": "LIFO",
+      "harness": "default",
+      "engine": "default"
+    },
+    {
+      "paper": "smallest_kv",
+      "harness": "shortest_first",
+      "engine": "shortest_first"
+    },
+    {
+      "paper": "input_length",
+      "harness": "input_length",
+      "engine": "input_length"
+    },
+    {
+      "paper": "largest_kv",
+      "harness": "largest_kv",
+      "engine": "largest_kv"
+    },
+    {
+      "paper": "entropy",
+      "harness": "entropy_remaining",
+      "engine": "entropy_remaining"
+    },
+    {
+      "paper": "empirical_statistical_length_oracle",
+      "harness": "oracle_remaining",
+      "engine": "oracle"
+    },
+    {
+      "paper": "random",
+      "harness": "random",
+      "engine": "random"
+    }
+  ],
+  "excluded_from_release_history": [
+    "m1_traces/agent_calls.jsonl",
+    "vllm/v1/core/probe_victim.py",
+    "tests/v1/core/test_probe_victim_selection.py"
+  ],
+  "equivalence_note": "The clean snapshot preserves the retained capture's exact vllm/ and docker/ Git trees. Historical traces do not record a Git SHA, and some runs predate creation of the retained capture commit."
+}
